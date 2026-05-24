@@ -1,22 +1,30 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
 import os
 import re
 import time
 import uuid
+from functools import lru_cache
+from importlib import metadata
 from io import BytesIO
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, Response, jsonify, make_response, request
+from werkzeug.exceptions import BadRequest
 from waitress import serve
 
 
 PORT = int(os.getenv("PORT", "5001"))
 HOST = os.getenv("HOST", "0.0.0.0")
+CATALOG_TTL_SECONDS = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
 
 MODEL_API_URL = "https://api.1min.ai/models"
 CHAT_API_URL = "https://api.1min.ai/api/chat-with-ai"
@@ -29,11 +37,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("one-min-ai-gateway")
 
 
-def fetch_catalog(feature: str) -> list[dict[str, Any]]:
+def gateway_version() -> str:
+    try:
+        return metadata.version("one-min-ai-gateway")
+    except metadata.PackageNotFoundError:
+        return "0.1.0"
+
+
+def cache_bucket() -> int:
+    return int(time.time() // CATALOG_TTL_SECONDS) if CATALOG_TTL_SECONDS > 0 else int(time.time())
+
+
+@lru_cache(maxsize=32)
+def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ...]:
     response = requests.get(MODEL_API_URL, params={"feature": feature}, timeout=30)
     response.raise_for_status()
     data = response.json()
-    return data.get("models") or []
+    models = data.get("models") or []
+    return tuple(entry for entry in models if isinstance(entry, dict))
+
+
+def fetch_catalog(feature: str) -> list[dict[str, Any]]:
+    return list(fetch_catalog_cached(feature, cache_bucket()))
 
 
 def chat_models() -> list[dict[str, Any]]:
@@ -73,9 +98,24 @@ def bearer_key() -> str | None:
 
 
 def add_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
     response.headers["X-Request-ID"] = str(uuid.uuid4())
     return response
+
+
+@app.after_request
+def add_default_headers(response):
+    return add_headers(response)
+
+
+def request_json() -> dict[str, Any] | tuple[Any, int]:
+    try:
+        data = request.get_json(force=True)
+    except BadRequest:
+        return error_response("Invalid JSON body.", 400, "invalid_json")
+    if not isinstance(data, dict):
+        return error_response("JSON body must be an object.", 400, "invalid_request_error")
+    return data
 
 
 def content_to_text(content: Any) -> tuple[str, list[str]]:
@@ -222,6 +262,57 @@ def upstream_error(response):
     return error_response(f"1min.ai API error ({response.status_code}): {body}", response.status_code)
 
 
+def response_json(response) -> dict[str, Any] | None:
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def decode_data_image(image_url: str) -> BytesIO | tuple[Any, int]:
+    try:
+        encoded = image_url.split(",", 1)[1]
+    except IndexError:
+        return error_response("Invalid image data URL.", 400, "invalid_image")
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return error_response("Invalid base64 image data.", 400, "invalid_image")
+    if len(payload) > MAX_IMAGE_BYTES:
+        return error_response("Image payload is too large.", 413, "image_too_large")
+    return BytesIO(payload)
+
+
+def fetch_remote_image(image_url: str) -> BytesIO | tuple[Any, int]:
+    parsed = urlparse(image_url)
+    if parsed.scheme not in {"http", "https"}:
+        return error_response("Image URL must use http or https.", 400, "invalid_image_url")
+    try:
+        fetched = requests.get(image_url, timeout=30, stream=True)
+        fetched.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("failed to fetch image URL: %s", exc)
+        return error_response("Could not fetch image URL.", 400, "invalid_image_url")
+    content_length = fetched.headers.get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_IMAGE_BYTES:
+                return error_response("Image payload is too large.", 413, "image_too_large")
+        except ValueError:
+            pass
+
+    data = BytesIO()
+    for chunk in fetched.iter_content(chunk_size=1024 * 1024):
+        if not chunk:
+            continue
+        data.write(chunk)
+        if data.tell() > MAX_IMAGE_BYTES:
+            return error_response("Image payload is too large.", 413, "image_too_large")
+    data.seek(0)
+    return data
+
+
 def upload_images(api_key: str, model: str, image_urls: list[str]) -> list[str] | tuple[Any, int]:
     if not image_urls:
         return []
@@ -231,11 +322,11 @@ def upload_images(api_key: str, model: str, image_urls: list[str]) -> list[str] 
     paths: list[str] = []
     for image_url in image_urls:
         if image_url.startswith("data:image/"):
-            binary_data = BytesIO(base64.b64decode(image_url.split(",", 1)[1]))
+            binary_data = decode_data_image(image_url)
         else:
-            fetched = requests.get(image_url, timeout=30)
-            fetched.raise_for_status()
-            binary_data = BytesIO(fetched.content)
+            binary_data = fetch_remote_image(image_url)
+        if isinstance(binary_data, tuple):
+            return binary_data
         upload = requests.post(
             ASSET_API_URL,
             files={"asset": (f"gateway-{uuid.uuid4()}.png", binary_data, "image/png")},
@@ -244,7 +335,13 @@ def upload_images(api_key: str, model: str, image_urls: list[str]) -> list[str] 
         )
         if upload.status_code != 200:
             return upstream_error(upload)
-        paths.append(upload.json()["fileContent"]["path"])
+        upload_data = response_json(upload)
+        if not upload_data:
+            return upstream_error(upload)
+        try:
+            paths.append(upload_data["fileContent"]["path"])
+        except KeyError:
+            return upstream_error(upload)
     return paths
 
 
@@ -271,6 +368,14 @@ def build_payload(api_key: str, data: dict[str, Any]):
     return payload
 
 
+def extract_result_text(data: dict[str, Any]) -> str | None:
+    try:
+        result = data["aiRecord"]["aiRecordDetail"]["resultObject"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+
+
 def token_count(text: str) -> int:
     return max(1, len(text) // 4)
 
@@ -278,6 +383,11 @@ def token_count(text: str) -> int:
 @app.route("/", methods=["GET"])
 def index():
     return "one-min-ai-gateway\n"
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"ok": True, "version": gateway_version()})
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -303,7 +413,7 @@ def models():
 def chat_completions():
     if request.method == "OPTIONS":
         response = make_response()
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         return response, 204
@@ -312,7 +422,9 @@ def chat_completions():
     if not api_key:
         return error_response("Invalid Authentication", 401, "invalid_api_key")
 
-    data = request.get_json(force=True)
+    data = request_json()
+    if isinstance(data, tuple):
+        return data
     payload = build_payload(api_key, data)
     if isinstance(payload, tuple):
         return payload
@@ -329,7 +441,12 @@ def chat_completions():
     if upstream.status_code != 200:
         return upstream_error(upstream)
 
-    raw_text = upstream.json()["aiRecord"]["aiRecordDetail"]["resultObject"][0]
+    upstream_data = response_json(upstream)
+    if upstream_data is None:
+        return upstream_error(upstream)
+    raw_text = extract_result_text(upstream_data)
+    if raw_text is None:
+        return upstream_error(upstream)
     call = parse_tool_text(raw_text, data.get("tools") or [])
     output_text = clean_text(raw_text)
     prompt_tokens = token_count(payload["promptObject"]["prompt"])
@@ -445,7 +562,9 @@ def image_generations():
     if not api_key:
         return error_response("Invalid Authentication", 401, "invalid_api_key")
 
-    data = request.get_json(force=True)
+    data = request_json()
+    if isinstance(data, tuple):
+        return data
     model = data.get("model", "black-forest-labs/flux-schnell")
     if model not in image_model_ids():
         return error_response(f"This model does not support image generation: {model}", 400, "model_not_supported")
@@ -471,7 +590,15 @@ def image_generations():
     if upstream.status_code != 200:
         return upstream_error(upstream)
 
-    urls = upstream.json()["aiRecord"]["aiRecordDetail"]["resultObject"]
+    upstream_data = response_json(upstream)
+    if upstream_data is None:
+        return upstream_error(upstream)
+    try:
+        urls = upstream_data["aiRecord"]["aiRecordDetail"]["resultObject"]
+    except (KeyError, TypeError):
+        return upstream_error(upstream)
+    if not isinstance(urls, list):
+        return upstream_error(upstream)
     return jsonify({"created": int(time.time()), "data": [{"url": url} for url in urls]})
 
 

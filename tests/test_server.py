@@ -26,6 +26,29 @@ def test_missing_bearer_token_returns_401():
     assert response.json["error"]["code"] == "invalid_api_key"
 
 
+def test_healthz_returns_version():
+    client = server.app.test_client()
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json["ok"] is True
+    assert response.json["version"]
+
+
+def test_invalid_json_returns_openai_error():
+    client = server.app.test_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer test-key", "Content-Type": "application/json"},
+        data="{",
+    )
+
+    assert response.status_code == 400
+    assert response.json["error"]["code"] == "invalid_json"
+
+
 def test_parse_tool_call_tag():
     tool_call = server.parse_tool_text(
         '<tool_call>{"name":"glob","arguments":{"pattern":"*"}}</tool_call>',
@@ -46,6 +69,53 @@ def test_parse_tool_code_tag():
 
 def test_clean_text_removes_fake_crawl_lines():
     assert server.clean_text("🌐 Crawling site https://example.com\nok") == "ok"
+
+
+def test_remote_image_rejects_non_http_url():
+    with server.app.test_request_context():
+        result = server.fetch_remote_image("file:///etc/passwd")
+
+    assert isinstance(result, tuple)
+    response, status = result
+    assert status == 400
+    assert response.json["error"]["code"] == "invalid_image_url"
+
+
+def test_remote_image_fetch_failure_returns_openai_error(monkeypatch):
+    def fail_get(*args, **kwargs):
+        raise server.requests.Timeout("slow")
+
+    monkeypatch.setattr(server.requests, "get", fail_get)
+
+    with server.app.test_request_context():
+        result = server.fetch_remote_image("https://example.com/image.png")
+
+    assert isinstance(result, tuple)
+    response, status = result
+    assert status == 400
+    assert response.json["error"]["code"] == "invalid_image_url"
+
+
+def test_data_image_rejects_invalid_base64():
+    with server.app.test_request_context():
+        result = server.decode_data_image("data:image/png;base64,not-valid")
+
+    assert isinstance(result, tuple)
+    response, status = result
+    assert status == 400
+    assert response.json["error"]["code"] == "invalid_image"
+
+
+def test_extract_result_text_handles_unexpected_upstream_shape():
+    assert server.extract_result_text({"unexpected": True}) is None
+
+
+def test_response_json_rejects_non_object():
+    class FakeResponse:
+        def json(self):
+            return ["not", "an", "object"]
+
+    assert server.response_json(FakeResponse()) is None
 
 
 def test_non_stream_chat_translates_tool_call(monkeypatch):
