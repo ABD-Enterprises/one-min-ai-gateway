@@ -1,0 +1,78 @@
+# one-min-ai-gateway
+
+OpenAI-compatible gateway for [1min.ai](https://1min.ai/).
+
+1min.ai exposes a feature-oriented API. This gateway provides a small
+OpenAI-compatible surface for clients that expect `/v1/models`,
+`/v1/chat/completions`, and `/v1/images/generations`.
+
+## Run
+
+```sh
+docker compose up -d --build
+```
+
+The gateway listens at:
+
+```text
+http://localhost:5001/v1
+```
+
+Clients pass the 1min.ai API key as an OpenAI-style bearer token. The
+gateway does not store API keys.
+
+## Plain Python
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .
+python server.py
+```
+
+## OpenCode
+
+Example provider config:
+
+```jsonc
+{
+  "provider": {
+    "1min-ai": {
+      "name": "1min.ai Gateway",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:5001/v1"
+      },
+      "models": {
+        "gemini-2.5-flash": {
+          "name": "Gemini 2.5 Flash"
+        }
+      }
+    }
+  }
+}
+```
+
+Store the credential with OpenCode or pass it as the client API key.
+
+## Endpoints
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/images/generations`
+
+## Tool Calling
+
+1min.ai models do not consistently return native OpenAI `tool_calls`.
+The gateway includes a best-effort compatibility shim for common
+tool-call-shaped text patterns and converts those into OpenAI-compatible
+`tool_calls`.
+
+This is intentionally conservative. It should not be treated as a
+guarantee of native tool calling support from every model.
+
+## Security
+
+- API keys are read from request `Authorization: Bearer ...` headers.
+- API keys are not written to disk.
+- Prompts and keys are not logged by default.

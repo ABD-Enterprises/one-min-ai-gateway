@@ -1,0 +1,13 @@
+name: one-min-ai-gateway
+
+services:
+  gateway:
+    build:
+      context: .
+    image: one-min-ai-gateway:local
+    container_name: one-min-ai-gateway
+    restart: unless-stopped
+    environment:
+      PORT: "5001"
+    ports:
+      - "${ONE_MIN_GATEWAY_PORT:-5001}:5001"
