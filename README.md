@@ -8,6 +8,14 @@ OpenAI-compatible surface for clients that expect `/v1/models`,
 
 ## Run
 
+Use the published container image:
+
+```sh
+docker run --rm -p 5001:5001 ghcr.io/deffenda/one-min-ai-gateway:latest
+```
+
+Or build locally with Docker Compose:
+
 ```sh
 docker compose up -d --build
 ```
@@ -76,3 +84,8 @@ guarantee of native tool calling support from every model.
 - API keys are read from request `Authorization: Bearer ...` headers.
 - API keys are not written to disk.
 - Prompts and keys are not logged by default.
+
+## Image Publishing
+
+Pushes to `main` publish `ghcr.io/deffenda/one-min-ai-gateway:latest`
+and a commit-SHA tag.
