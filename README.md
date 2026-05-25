@@ -11,7 +11,7 @@ OpenAI-compatible surface for clients that expect `/v1/models`,
 Use the published container image:
 
 ```sh
-docker run --rm -p 5001:5001 ghcr.io/deffenda/one-min-ai-gateway:latest
+docker run --rm -p 5001:5001 ghcr.io/abd-enterprises/one-min-ai-gateway:latest
 ```
 
 Or build locally with Docker Compose:
@@ -96,5 +96,5 @@ guarantee of native tool calling support from every model.
 
 ## Image Publishing
 
-Pushes to `main` publish `ghcr.io/deffenda/one-min-ai-gateway:latest`
+Pushes to `main` publish `ghcr.io/abd-enterprises/one-min-ai-gateway:latest`
 and a commit-SHA tag.
