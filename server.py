@@ -5,9 +5,11 @@ import binascii
 import json
 import logging
 import os
+import socket
 import re
 import time
 import uuid
+import ipaddress
 from functools import lru_cache
 from importlib import metadata
 from io import BytesIO
@@ -41,7 +43,7 @@ def gateway_version() -> str:
     try:
         return metadata.version("one-min-ai-gateway")
     except metadata.PackageNotFoundError:
-        return "0.1.0"
+        return "0.1.1"
 
 
 def cache_bucket() -> int:
@@ -50,10 +52,20 @@ def cache_bucket() -> int:
 
 @lru_cache(maxsize=32)
 def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ...]:
-    response = requests.get(MODEL_API_URL, params={"feature": feature}, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    models = data.get("models") or []
+    try:
+        response = requests.get(MODEL_API_URL, params={"feature": feature}, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        logger.warning("failed to fetch model catalog for feature %s: %s", feature, exc)
+        return tuple()
+    except ValueError:
+        logger.warning("failed to parse model catalog response for feature %s", feature)
+        return tuple()
+
+    models = data.get("models") if isinstance(data, dict) else []
+    if not isinstance(models, list):
+        models = []
     return tuple(entry for entry in models if isinstance(entry, dict))
 
 
@@ -270,6 +282,53 @@ def response_json(response) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def is_disallowed_host(hostname: str) -> bool:
+    normalized = (hostname or "").strip().lower().strip("[]")
+    if not normalized:
+        return True
+    if normalized in {"localhost", "localhost.localdomain"}:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(normalized)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    except ValueError:
+        pass
+
+    try:
+        addresses = socket.getaddrinfo(normalized, None)
+    except socket.gaierror:
+        return False
+
+    for _, _, _, _, sockaddr in addresses:
+        if not sockaddr:
+            continue
+        ip_str = sockaddr[0]
+        if ip_str.startswith("::ffff:"):
+            ip_str = ip_str[7:]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return True
+    return False
+
+
+def validate_messages(messages: Any) -> tuple[Any, int] | None:
+    if not isinstance(messages, list) or not messages:
+        return error_response("messages must be a non-empty array.", 400, "invalid_request_error")
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return error_response(
+                f"Message at index {index} must be an object.",
+                400,
+                "invalid_request_error",
+            )
+    return None
+
+
 def decode_data_image(image_url: str) -> BytesIO | tuple[Any, int]:
     try:
         encoded = image_url.split(",", 1)[1]
@@ -288,12 +347,21 @@ def fetch_remote_image(image_url: str) -> BytesIO | tuple[Any, int]:
     parsed = urlparse(image_url)
     if parsed.scheme not in {"http", "https"}:
         return error_response("Image URL must use http or https.", 400, "invalid_image_url")
+    if not parsed.hostname:
+        return error_response("Invalid image URL.", 400, "invalid_image_url")
+    if is_disallowed_host(parsed.hostname):
+        return error_response("Image URL host is not allowed.", 400, "invalid_image_url")
+
     try:
-        fetched = requests.get(image_url, timeout=30, stream=True)
+        fetched = requests.get(image_url, timeout=30, stream=True, allow_redirects=False)
         fetched.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("failed to fetch image URL: %s", exc)
         return error_response("Could not fetch image URL.", 400, "invalid_image_url")
+
+    if 300 <= fetched.status_code < 400:
+        return error_response("Could not fetch image URL.", 400, "invalid_image_url")
+
     content_length = fetched.headers.get("Content-Length")
     if content_length:
         try:
@@ -347,8 +415,9 @@ def upload_images(api_key: str, model: str, image_urls: list[str]) -> list[str] 
 
 def build_payload(api_key: str, data: dict[str, Any]):
     messages = data.get("messages") or []
-    if not messages:
-        return error_response("No message provided.", 400, "invalid_request_error")
+    validation = validate_messages(messages)
+    if validation is not None:
+        return validation
 
     model = data.get("model", "gpt-4o")
     prompt, image_urls = format_messages(messages)
@@ -476,9 +545,62 @@ def chat_completions():
 
 
 def stream_response(upstream, data: dict[str, Any], model: str):
-    chunks: list[str] = []
+    buffered_text = ""
+    tail_size = 200
     current_event = None
     stream_id = f"chatcmpl-{uuid.uuid4()}"
+    tools = data.get("tools") or []
+
+    def emit_content_chunk(content: str, finish_reason: str | None = None):
+        if not content:
+            return
+        yield "data: " + json.dumps(
+            {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": content},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ) + "\n\n"
+
+    def emit_tool_call(call: dict[str, Any]):
+        call_payload = tool_message(call)["tool_calls"][0]
+        yield from [
+            "data: "
+            + json.dumps(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": {"tool_calls": [{**call_payload, "index": 0}]}, "finish_reason": None}
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n",
+        ]
 
     for raw_line in upstream.iter_lines(decode_unicode=False):
         if raw_line == b"":
@@ -501,47 +623,23 @@ def stream_response(upstream, data: dict[str, Any], model: str):
         except json.JSONDecodeError:
             content = raw_data
         if content:
-            chunks.append(content)
+            buffered_text += content
+            call = parse_tool_text(buffered_text, tools)
+            if call:
+                yield from emit_tool_call(call)
+                yield "data: [DONE]\n\n"
+                return
 
-    raw_text = "".join(chunks)
-    call = parse_tool_text(raw_text, data.get("tools") or [])
-    output_text = clean_text(raw_text)
-    if call:
-        call_payload = tool_message(call)["tool_calls"][0]
-        yield "data: " + json.dumps(
-            {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"tool_calls": [{**call_payload, "index": 0}]}, "finish_reason": None}],
-            },
-            ensure_ascii=False,
-        ) + "\n\n"
-        yield "data: " + json.dumps(
-            {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-            },
-            ensure_ascii=False,
-        ) + "\n\n"
-        yield "data: [DONE]\n\n"
-        return
+            if len(buffered_text) > tail_size:
+                flush = buffered_text[:-tail_size]
+                if flush:
+                    cleaned = clean_text(flush)
+                    yield from emit_content_chunk(cleaned)
+                buffered_text = buffered_text[-tail_size:]
 
-    if output_text:
-        yield "data: " + json.dumps(
-            {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": output_text}, "finish_reason": None}],
-            },
-            ensure_ascii=False,
-        ) + "\n\n"
+    text = clean_text(buffered_text)
+    if text:
+        yield from emit_content_chunk(text)
 
     yield "data: " + json.dumps(
         {
