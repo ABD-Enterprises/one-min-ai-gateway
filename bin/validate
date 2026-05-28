@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+# Define console styling
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+echo -e "${BOLD}${BLUE}==> Running all repository validation checks...${NC}"
+
+# Navigate to project root
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+# Ensure we use virtual environment tools if active or available
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
+
+# Track errors
+FAILED=0
+
+# 1. Format check
+echo -e "\n${BOLD}[1/4] Checking code formatting (Ruff)...${NC}"
+if ruff format --check .; then
+    echo -e "${GREEN}--> Formatting check passed.${NC}"
+else
+    echo -e "${RED}--> Formatting check failed. Run 'ruff format .' to resolve.${NC}"
+    FAILED=1
+fi
+
+# 2. Lint check
+echo -e "\n${BOLD}[2/4] Running code linter (Ruff)...${NC}"
+if ruff check .; then
+    echo -e "${GREEN}--> Linting check passed.${NC}"
+else
+    echo -e "${RED}--> Linting check failed. Run 'ruff check . --fix' to resolve.${NC}"
+    FAILED=1
+fi
+
+# 3. Type check
+echo -e "\n${BOLD}[3/4] Running type safety checks (Mypy)...${NC}"
+if mypy .; then
+    echo -e "${GREEN}--> Type safety checks passed.${NC}"
+else
+    echo -e "${RED}--> Type safety checks failed. Fix the type annotation errors.${NC}"
+    FAILED=1
+fi
+
+# 4. Unit tests
+echo -e "\n${BOLD}[4/4] Executing test suite (Pytest)...${NC}"
+if PYTHONPATH=. pytest; then
+    echo -e "${GREEN}--> All unit tests passed.${NC}"
+else
+    echo -e "${RED}--> Test suite failed. Fix failing assertions.${NC}"
+    FAILED=1
+fi
+
+# Final summary
+echo -e "\n${BOLD}==> Validation Summary:${NC}"
+if [ $FAILED -eq 0 ]; then
+    echo -e "${BOLD}${GREEN}✔ ALL CHECKS PASSED SUCCESSFULLY! Code is green and mergeable.${NC}"
+    exit 0
+else
+    echo -e "${BOLD}${RED}✘ SOME CHECKS FAILED! Please inspect errors above before committing.${NC}"
+    exit 1
+fi

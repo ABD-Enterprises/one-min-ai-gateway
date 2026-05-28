@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Define console styling
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+echo -e "${BOLD}${BLUE}==> Starting one-min-ai-gateway setup script...${NC}"
+
+# Navigate to the project root directory
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+# Create virtual environment if it does not exist
+if [ ! -d ".venv" ]; then
+    echo -e "${BLUE}--> Creating virtual environment in .venv...${NC}"
+    python3 -m venv .venv
+    echo -e "${GREEN}--> Virtual environment created successfully.${NC}"
+else
+    echo -e "${GREEN}--> Virtual environment already exists at .venv.${NC}"
+fi
+
+# Activate virtual environment
+echo -e "${BLUE}--> Activating virtual environment...${NC}"
+source .venv/bin/activate
+
+# Upgrade pip and install package dependencies
+echo -e "${BLUE}--> Installing one-min-ai-gateway dependencies...${NC}"
+pip install --upgrade pip
+pip install -e ".[test]"
+echo -e "${GREEN}--> Dependencies installed successfully.${NC}"
+
+# Run validation checks to verify setup is clean and active
+echo -e "${BLUE}--> Verifying developer environment setup...${NC}"
+if ./bin/validate; then
+    echo -e "\n${BOLD}${GREEN}==> Setup Complete! Everything is green and clean!${NC}"
+    echo -e "To start developing, run:"
+    echo -e "  source .venv/bin/activate"
+    echo -e "  one-min-ai-gateway"
+else
+    echo -e "\n${BOLD}${RED}==> Setup completed, but validation checks failed. Please verify errors.${NC}"
+    exit 1
+fi

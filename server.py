@@ -739,7 +739,7 @@ def is_disallowed_host(hostname: str) -> bool:
     for _, _, _, _, sockaddr in addresses:
         if not sockaddr:
             continue
-        ip_str = sockaddr[0]
+        ip_str = str(sockaddr[0])
         if ip_str.startswith("::ffff:"):
             ip_str = ip_str[7:]
         try:
@@ -1430,7 +1430,7 @@ def create_app() -> Flask:
 
     # 4. Global OPTIONS CORS Preflight interceptor
     @app.before_request
-    def handle_options_preflight() -> Response | None:
+    def handle_options_preflight() -> Response | tuple[Response, int] | None:
         if request.method == "OPTIONS":
             response = make_response()
             response.headers["Access-Control-Allow-Origin"] = config.CORS_ALLOW_ORIGIN

@@ -19,6 +19,8 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=8.0,<10.0",
+  "mypy>=1.8,<2.0",
+  "types-requests>=2.31,<3.0",
 ]
 
 [project.scripts]
@@ -26,3 +28,12 @@ one-min-ai-gateway = "server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_unused_ignores = true
+disable_error_code = ["import-untyped"]
+exclude = ["tests/"]

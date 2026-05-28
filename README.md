@@ -33,9 +33,18 @@ Useful environment variables:
 
 - `PORT`: listen port inside the container, default `5001`
 - `HOST`: listen host, default `0.0.0.0`
-- `CATALOG_TTL_SECONDS`: model catalog cache TTL, default `300`
-- `MAX_IMAGE_BYTES`: maximum image upload/fetch payload, default `10485760`
+- `CATALOG_TTL_SECONDS`: model catalog cache TTL in seconds, default `300`
+- `MAX_IMAGE_BYTES`: maximum image upload/fetch payload in bytes, default `10485760` (10 MB)
 - `CORS_ALLOW_ORIGIN`: CORS origin value, default `*`
+- `DEFAULT_CHAT_MODEL`: default fallback chat model, default `gpt-4o`
+- `DEFAULT_IMAGE_MODEL`: default fallback image generator model, default `black-forest-labs/flux-schnell`
+- `ONE_MIN_API_BASE_URL`: upstream 1min.ai API base endpoint, default `https://api.1min.ai`
+- `GATEWAY_VERIFY_SSL`: enforce SSL/TLS verification on upstream HTTP calls, default `true` (set to `false` only in local test environments)
+- `WAITRESS_THREADS`: internal Waitress server worker thread concurrency, default `8`
+- `LOG_LEVEL`: console log severity filter (`DEBUG`, `INFO`, `WARNING`, `ERROR`), default `INFO`
+- `GATEWAY_POOL_SIZE`: maximum connection pool size inside HTTP persistent adapters, default `20`
+- `GATEWAY_POOL_CONNECTIONS`: persistent pool connections count inside HTTP persistent adapters, default `20`
+- `PROPAGATE_HEADERS`: comma-separated list of HTTP request headers to forward from incoming clients to upstream 1min.ai (e.g. `X-Gateway-Trace,X-Client-Id`), default `""`
 
 ## Plain Python
 
