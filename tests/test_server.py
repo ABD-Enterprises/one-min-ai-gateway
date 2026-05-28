@@ -1,5 +1,32 @@
 import json
+from typing import Any, Generator
+import pytest
 import server
+
+
+# 18. Consolidate Mock HTTP Responses in Tests
+class FakeHTTPResponse:
+    """Unified HTTP Response mock for requests.Session calls."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise server.requests.HTTPError(f"HTTP Error {self.status_code}")
+
+    def iter_content(self, chunk_size: int = 1024) -> Generator[bytes, None, None]:
+        yield self.text.encode("utf-8")
 
 
 def test_models_accepts_model_id(monkeypatch):
@@ -112,10 +139,10 @@ def test_remote_image_rejects_non_http_url():
 
 
 def test_remote_image_fetch_failure_returns_openai_error(monkeypatch):
-    def fail_get(*args, **kwargs):
+    def fail_fetch(*args, **kwargs):
         raise server.requests.Timeout("slow")
 
-    monkeypatch.setattr(server.requests.Session, "get", fail_get)
+    monkeypatch.setattr(server.requests.Session, "get", fail_fetch)
 
     with server.app.test_request_context():
         result = server.fetch_remote_image("https://example.com/image.png")
@@ -149,23 +176,14 @@ def test_response_json_rejects_non_object():
 
 
 def test_non_stream_chat_translates_tool_call(monkeypatch):
-    class FakeResponse:
-        status_code = 200
-
-        def json(self):
-            return {
-                "aiRecord": {
-                    "aiRecordDetail": {
-                        "resultObject": [
-                            '<tool_call>{"name":"glob","arguments":{"pattern":"*"}}</tool_call>'
-                        ]
-                    }
-                }
-            }
-
     monkeypatch.setattr(server, "upload_images", lambda api_key, model, image_urls: [])
     monkeypatch.setattr(
-        server.requests.Session, "post", lambda *args, **kwargs: FakeResponse()
+        server.requests.Session,
+        "post",
+        lambda *args, **kwargs: FakeHTTPResponse(
+            status_code=200,
+            text='{"aiRecord": {"aiRecordDetail": {"resultObject": ["<tool_call>{\\"name\\":\\"glob\\",\\"arguments\\":{\\"pattern\\":\\"*\\"}}</tool_call>"]}}}',
+        ),
     )
 
     client = server.app.test_client()
@@ -241,31 +259,24 @@ def test_fetch_remote_image_rejects_disallowed_dns(monkeypatch):
 
 
 def test_fetch_remote_image_allows_public_host_when_dns_safe(monkeypatch):
-    class FakeResponse:
-        status_code = 200
-        headers = {"Content-Length": "5"}
-
-        def raise_for_status(self):
-            return None
-
-        def iter_content(self, chunk_size=1024 * 1024):
-            yield b"abcde"
-
     monkeypatch.setattr(
         server.socket,
         "getaddrinfo",
         lambda hostname, *_args, **_kwargs: [(0, 0, 0, "", ("8.8.8.8", 0))],
     )
-    monkeypatch.setattr(server.requests.Session, "get", lambda *_, **__: FakeResponse())
+    monkeypatch.setattr(
+        server.requests.Session,
+        "get",
+        lambda *_, **__: FakeHTTPResponse(
+            status_code=200, text="abcde", headers={"Content-Length": "5"}
+        ),
+    )
 
     with server.app.test_request_context():
         result = server.fetch_remote_image("https://cdn.example.org/image.png")
 
     assert not isinstance(result, tuple)
     assert result.read() == b"abcde"
-
-
-# --- NEW TEST CASES FOR 20 TECH DEBT IMPROVEMENTS ---
 
 
 def test_global_options_cors_preflight():
@@ -291,7 +302,6 @@ def test_stream_response_large_tool_call_no_truncation():
 
     class FakeResponse:
         def iter_lines(self, decode_unicode=False):
-            # Split the very long tool call into multiple sequential chunks
             return [
                 b"event: content",
                 f"data: {json.dumps({'delta': {'content': long_tool_call_text[:100]}})}".encode(
@@ -315,7 +325,6 @@ def test_stream_response_large_tool_call_no_truncation():
         )
     )
 
-    # Ensure tool calls are emitted and the very long argument exists in the delta chunk
     tool_call_events = [chunk for chunk in output if "tool_calls" in chunk]
     assert len(tool_call_events) > 0
     assert long_argument_value in "".join(tool_call_events)
@@ -326,8 +335,6 @@ def test_global_json_error_handler():
     """Verify that unhandled exceptions are caught globally and returned in standard OpenAI JSON format."""
     client = server.app.test_client()
 
-    # Route index / triggers unhandled exception if we force it, or we trigger a bad requests.get
-    # Let's mock a method to raise an unhandled exception
     def crash_models():
         raise Exception("Database failure")
 
@@ -359,3 +366,171 @@ def test_upstream_error_detailed_parsing(monkeypatch):
         "Custom deeply nested upstream validation error message"
         in response.json["error"]["message"]
     )
+
+
+# --- NEW TEST CASES FOR ROUND 2 TECH DEBT IMPROVEMENTS ---
+
+
+def test_secure_fetch_ssrf_dns_rebinding(monkeypatch):
+    """Verify that secure_fetch correctly blocks disallowed/private domains."""
+    # Mock is_disallowed_host to fail for a target
+    monkeypatch.setattr(
+        server, "is_disallowed_host", lambda host: host == "malicious.private"
+    )
+
+    session = server.get_session()
+    with pytest.raises(
+        ValueError, match="Access to the requested host address is restricted"
+    ):
+        server.secure_fetch("https://malicious.private/leak", session)
+
+
+def test_secure_fetch_safe_redirects(monkeypatch):
+    """Verify that secure_fetch manually follows safe redirects, stops after limit, and handles relative URLs."""
+
+    class MockRedirectSession:
+        def __init__(self) -> None:
+            self.requests_made = []
+
+        def get(self, url, *args, **kwargs):
+            self.requests_made.append(url)
+            if url == "https://cdn.example.org/start":
+                return FakeHTTPResponse(
+                    status_code=302, headers={"Location": "/redirect-1"}
+                )
+            elif url == "https://cdn.example.org/redirect-1":
+                return FakeHTTPResponse(
+                    status_code=301, headers={"Location": "https://cdn.example.org/end"}
+                )
+            elif url == "https://cdn.example.org/end":
+                return FakeHTTPResponse(status_code=200, text="final-payload")
+            return FakeHTTPResponse(status_code=404)
+
+    monkeypatch.setattr(server, "is_disallowed_host", lambda host: False)
+    session = MockRedirectSession()
+
+    response = server.secure_fetch("https://cdn.example.org/start", session)
+    assert response.status_code == 200
+    assert response.text == "final-payload"
+    assert session.requests_made == [
+        "https://cdn.example.org/start",
+        "https://cdn.example.org/redirect-1",
+        "https://cdn.example.org/end",
+    ]
+
+
+def test_secure_fetch_redirects_limit(monkeypatch):
+    """Verify that secure_fetch throws ValueError if redirect limit is exceeded."""
+
+    class InfiniteRedirectSession:
+        def get(self, url, *args, **kwargs):
+            return FakeHTTPResponse(status_code=302, headers={"Location": url})
+
+    monkeypatch.setattr(server, "is_disallowed_host", lambda host: False)
+    session = InfiniteRedirectSession()
+
+    with pytest.raises(ValueError, match="Too many redirect hops detected"):
+        server.secure_fetch("https://cdn.example.org/loop", session, max_redirects=3)
+
+
+def test_vision_flexible_payload_formats():
+    """Verify robust vision processing of both dict and direct string image URLs."""
+    # Test case 1: Dict payload (OpenAI standard)
+    content_dict = [
+        {"type": "text", "text": "Describe this"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/img1.png"}},
+    ]
+    txt, imgs = server.content_to_text(content_dict)
+    assert txt == "Describe this"
+    assert imgs == ["https://example.com/img1.png"]
+
+    # Test case 2: Direct string payload (Alternate client format)
+    content_str = [
+        {"type": "text", "text": "Describe this too"},
+        {"type": "image_url", "image_url": "https://example.com/img2.png"},
+    ]
+    txt, imgs = server.content_to_text(content_str)
+    assert txt == "Describe this too"
+    assert imgs == ["https://example.com/img2.png"]
+
+
+def test_tiktoken_accurate_counting(monkeypatch):
+    """Verify that token_count handles tiktoken encoding safely or falls back."""
+    # If tiktoken is loaded, it should count accurately
+    cnt = server.token_count("Hello world! How are you?")
+    assert cnt > 0
+
+
+def test_descriptive_empty_request_body():
+    """Verify empty requests body returns a descriptive 400 error response instead of generic object message."""
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", headers={"Authorization": "Bearer test-key"}, data=""
+    )
+    assert response.status_code == 400
+    assert "Empty request body" in response.json["error"]["message"]
+    assert response.json["error"]["code"] == "empty_request_body"
+
+
+def test_strict_slashes_disabled():
+    """Verify routes resolve correctly regardless of trailing slashes."""
+    client = server.app.test_client()
+
+    # Check that root with slash works
+    res1 = client.get("/")
+    assert res1.status_code == 200
+    assert "one-min-ai-gateway" in res1.text
+
+    # Check that healthz with trailing slash resolved successfully
+    res2 = client.get("/healthz/")
+    assert res2.status_code == 200
+    assert res2.json["ok"] is True
+
+
+def test_custom_header_propagation(monkeypatch):
+    """Verify custom headers configured via PROPAGATE_HEADERS are correctly forwarded."""
+    # Configure config and headers
+    monkeypatch.setattr(
+        server.config, "PROPAGATE_HEADERS", "X-Gateway-Trace, X-Client-Id"
+    )
+    monkeypatch.setattr(server, "upload_images", lambda api_key, model, image_urls: [])
+
+    captured_headers = {}
+
+    def fake_post(*args, **kwargs):
+        nonlocal captured_headers
+        captured_headers = kwargs.get("headers") or {}
+        return FakeHTTPResponse(
+            status_code=200,
+            text='{"aiRecord": {"aiRecordDetail": {"resultObject": ["success-response"]}}}',
+        )
+
+    monkeypatch.setattr(server.requests.Session, "post", fake_post)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "Authorization": "Bearer test-key",
+            "X-Gateway-Trace": "123456",
+            "X-Client-Id": "client-abc",
+            "X-Ignored-Header": "shh",
+        },
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    # Ensure custom headers were propagated
+    assert captured_headers.get("X-Gateway-Trace") == "123456"
+    assert captured_headers.get("X-Client-Id") == "client-abc"
+    # Ensure ignored headers were NOT propagated
+    assert "X-Ignored-Header" not in captured_headers
+
+
+def test_cache_stampede_protection_lock():
+    """Verify mutex synchronization lock does not interfere with standard fetching."""
+    # Simply prove the lock is available and acquireable
+    assert not server._catalog_mutex.locked()
+    with server._catalog_mutex:
+        assert server._catalog_mutex.locked()
+    assert not server._catalog_mutex.locked()

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import binascii
+from dataclasses import dataclass
 import json
 import logging
 import os
 import socket
 import re
+import threading
 import time
 import uuid
 import ipaddress
@@ -14,7 +17,7 @@ from functools import lru_cache
 from importlib import metadata
 from io import BytesIO
 from typing import Any, Generator
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from flask import (
@@ -31,43 +34,80 @@ from werkzeug.exceptions import BadRequest
 from waitress import serve
 
 
-# 7. Centralized Default Model Configurations
-DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "gpt-4o")
-DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "black-forest-labs/flux-schnell")
+# 13. Centralized GatewayConfig Class
+@dataclass
+class GatewayConfig:
+    """Consolidated configuration holder for the gateway."""
 
-# 8. Hardcoded Upstream API Base URLs
-ONE_MIN_API_BASE_URL = os.getenv("ONE_MIN_API_BASE_URL", "https://api.1min.ai").rstrip(
-    "/"
-)
-MODEL_API_URL = f"{ONE_MIN_API_BASE_URL}/models"
-CHAT_API_URL = f"{ONE_MIN_API_BASE_URL}/api/chat-with-ai"
-CHAT_STREAM_API_URL = f"{ONE_MIN_API_BASE_URL}/api/chat-with-ai?isStreaming=true"
-ASSET_API_URL = f"{ONE_MIN_API_BASE_URL}/api/assets"
-FEATURE_API_URL = f"{ONE_MIN_API_BASE_URL}/api/features"
+    DEFAULT_CHAT_MODEL: str = os.getenv("DEFAULT_CHAT_MODEL", "gpt-4o")
+    DEFAULT_IMAGE_MODEL: str = os.getenv(
+        "DEFAULT_IMAGE_MODEL", "black-forest-labs/flux-schnell"
+    )
+    ONE_MIN_API_BASE_URL: str = os.getenv(
+        "ONE_MIN_API_BASE_URL", "https://api.1min.ai"
+    ).rstrip("/")
+    GATEWAY_VERIFY_SSL: bool = os.getenv("GATEWAY_VERIFY_SSL", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
+    MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+    CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
+    PORT: int = 5001
+    HOST: str = os.getenv("HOST", "0.0.0.0")
+    WAITRESS_THREADS: int = 8
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    GATEWAY_POOL_SIZE: int = int(os.getenv("GATEWAY_POOL_SIZE", "20"))
+    GATEWAY_POOL_CONNECTIONS: int = int(os.getenv("GATEWAY_POOL_CONNECTIONS", "20"))
+    PROPAGATE_HEADERS: str = os.getenv("PROPAGATE_HEADERS", "")
 
-# 15. Lack of SSL/TLS Verification Customizability
-GATEWAY_VERIFY_SSL = os.getenv("GATEWAY_VERIFY_SSL", "true").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+    def __post_init__(self) -> None:
+        # Handle PORT conversion safely
+        port_env = os.getenv("PORT", "5001")
+        try:
+            self.PORT = int(port_env)
+        except ValueError:
+            self.PORT = 5001
 
-PORT_ENV = os.getenv("PORT", "5001")
-try:
-    PORT = int(PORT_ENV)
-except ValueError:
-    # 12. Crashes on Invalid PORT Environment Variable
-    PORT = 5001
+        # Handle WAITRESS_THREADS safely
+        threads_env = os.getenv("WAITRESS_THREADS", "8")
+        try:
+            self.WAITRESS_THREADS = int(threads_env)
+        except ValueError:
+            self.WAITRESS_THREADS = 8
 
-HOST = os.getenv("HOST", "0.0.0.0")
-CATALOG_TTL_SECONDS = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
-CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
+
+# Instantiate global settings configuration
+config = GatewayConfig()
+
+
+# Build absolute API endpoints based on base URL setting
+def model_api_url() -> str:
+    return f"{config.ONE_MIN_API_BASE_URL}/models"
+
+
+def chat_api_url() -> str:
+    return f"{config.ONE_MIN_API_BASE_URL}/api/chat-with-ai"
+
+
+def chat_stream_api_url() -> str:
+    return f"{config.ONE_MIN_API_BASE_URL}/api/chat-with-ai?isStreaming=true"
+
+
+def asset_api_url() -> str:
+    return f"{config.ONE_MIN_API_BASE_URL}/api/assets"
+
+
+def feature_api_url() -> str:
+    return f"{config.ONE_MIN_API_BASE_URL}/api/features"
+
 
 logger = logging.getLogger("one-min-ai-gateway")
 
 # 5. Persistent Connection Pooling
 _session: requests.Session | None = None
+_session_lock = threading.Lock()
 
 
 def get_session() -> requests.Session:
@@ -78,11 +118,49 @@ def get_session() -> requests.Session:
     """
     global _session
     if _session is None:
-        _session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
-        _session.mount("https://", adapter)
-        _session.mount("http://", adapter)
+        with _session_lock:
+            if _session is None:
+                _session = requests.Session()
+                # 6. Configurable Connection Pool Sizes
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=config.GATEWAY_POOL_CONNECTIONS,
+                    pool_maxsize=config.GATEWAY_POOL_SIZE,
+                )
+                _session.mount("https://", adapter)
+                _session.mount("http://", adapter)
     return _session
+
+
+# 5. Clean Connection Pool Shutdown (atexit hook)
+@atexit.register
+def close_session() -> None:
+    """Cleanly close the global persistent requests Session on shutdown."""
+    global _session
+    if _session is not None:
+        try:
+            _session.close()
+            # Note: logging inside atexit can fail if logging is already dismantled, so we handle it quietly
+        except Exception:
+            pass
+
+
+# 17. Custom Header Propagation List
+def propagated_headers() -> dict[str, str]:
+    """Retrieve propagating headers from current Flask request context.
+
+    Returns:
+        dict[str, str]: Propagated header key/value pairs.
+    """
+    headers = {}
+    if config.PROPAGATE_HEADERS and has_request_context():
+        names = [
+            name.strip() for name in config.PROPAGATE_HEADERS.split(",") if name.strip()
+        ]
+        for name in names:
+            val = request.headers.get(name)
+            if val is not None:
+                headers[name] = val
+    return headers
 
 
 # 6. Observability: Request ID Correlation in Logs
@@ -98,8 +176,12 @@ class RequestIdFilter(logging.Filter):
 
 
 def configure_logging() -> None:
-    """Configure global and logger-specific logging with correlation IDs."""
-    logging.basicConfig(level=logging.INFO)
+    """Configure global, waitress, and logger-specific logging with correlation IDs."""
+    # 16. Safe LOG_LEVEL Customizability
+    log_level_name = config.LOG_LEVEL
+    log_level = getattr(logging, log_level_name, logging.INFO)
+
+    logging.basicConfig(level=log_level)
     root = logging.getLogger()
     req_filter = RequestIdFilter()
     formatter = logging.Formatter(
@@ -115,7 +197,14 @@ def configure_logging() -> None:
     for handler in logger.handlers:
         handler.addFilter(req_filter)
         handler.setFormatter(formatter)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(log_level)
+
+    # 14. Intercept Waitress internal logger
+    waitress_logger = logging.getLogger("waitress")
+    for handler in waitress_logger.handlers:
+        handler.addFilter(req_filter)
+        handler.setFormatter(formatter)
+    waitress_logger.setLevel(log_level)
 
 
 def gateway_version() -> str:
@@ -137,15 +226,19 @@ def cache_bucket() -> int:
         int: Time-based bucket identifier.
     """
     return (
-        int(time.time() // CATALOG_TTL_SECONDS)
-        if CATALOG_TTL_SECONDS > 0
+        int(time.time() // config.CATALOG_TTL_SECONDS)
+        if config.CATALOG_TTL_SECONDS > 0
         else int(time.time())
     )
 
 
+# 4. Cache Stampede Protection (Mutex Locking)
+_catalog_mutex = threading.Lock()
+
+
 @lru_cache(maxsize=32)
 def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ...]:
-    """Fetch model catalog with TTL caching.
+    """Fetch model catalog with TTL caching and Cache Stampede protection.
 
     Args:
         feature: The model feature identifier.
@@ -154,26 +247,31 @@ def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ..
     Returns:
         tuple[dict[str, Any], ...]: The models entries catalog.
     """
-    try:
-        response = get_session().get(
-            MODEL_API_URL,
-            params={"feature": feature},
-            timeout=30,
-            verify=GATEWAY_VERIFY_SSL,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        logger.warning("failed to fetch model catalog for feature %s: %s", feature, exc)
-        return tuple()
-    except ValueError:
-        logger.warning("failed to parse model catalog response for feature %s", feature)
-        return tuple()
+    with _catalog_mutex:
+        try:
+            response = get_session().get(
+                model_api_url(),
+                params={"feature": feature},
+                timeout=30,
+                verify=config.GATEWAY_VERIFY_SSL,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            logger.warning(
+                "failed to fetch model catalog for feature %s: %s", feature, exc
+            )
+            return tuple()
+        except ValueError:
+            logger.warning(
+                "failed to parse model catalog response for feature %s", feature
+            )
+            return tuple()
 
-    models = data.get("models") if isinstance(data, dict) else []
-    if not isinstance(models, list):
-        models = []
-    return tuple(entry for entry in models if isinstance(entry, dict))
+        models = data.get("models") if isinstance(data, dict) else []
+        if not isinstance(models, list):
+            models = []
+        return tuple(entry for entry in models if isinstance(entry, dict))
 
 
 def fetch_catalog(feature: str) -> list[dict[str, Any]]:
@@ -206,7 +304,6 @@ def model_id(entry: dict[str, Any]) -> str:
     Returns:
         str: The identified model ID.
     """
-    # 19. Inefficient Model ID Parsing Fallbacks
     val = entry.get("id") or entry.get("modelId")
     if not val:
         logger.warning("Catalog model entry lacks a valid identifier: %s", entry)
@@ -214,37 +311,37 @@ def model_id(entry: dict[str, Any]) -> str:
     return str(val)
 
 
-# 20. Vision and Image Model ID Sets Cache Invalidation
+# 7. Vision and Image Model ID Sets Cache Optimization (frozenset)
 @lru_cache(maxsize=32)
-def vision_model_ids_cached(_bucket: int) -> set[str]:
+def vision_model_ids_cached(_bucket: int) -> frozenset[str]:
     """Retrieve and cache vision model IDs for the active cache bucket."""
-    return {
+    return frozenset(
         model_id(entry) for entry in fetch_catalog("CHAT_WITH_IMAGE") if model_id(entry)
-    }
+    )
 
 
-def vision_model_ids() -> set[str]:
+def vision_model_ids() -> frozenset[str]:
     """Retrieve current set of vision model IDs.
 
     Returns:
-        set[str]: Set of model IDs supporting image inputs.
+        frozenset[str]: Set of model IDs supporting image inputs.
     """
     return vision_model_ids_cached(cache_bucket())
 
 
 @lru_cache(maxsize=32)
-def image_model_ids_cached(_bucket: int) -> set[str]:
+def image_model_ids_cached(_bucket: int) -> frozenset[str]:
     """Retrieve and cache image generator model IDs for the active cache bucket."""
-    return {
+    return frozenset(
         model_id(entry) for entry in fetch_catalog("IMAGE_GENERATOR") if model_id(entry)
-    }
+    )
 
 
-def image_model_ids() -> set[str]:
+def image_model_ids() -> frozenset[str]:
     """Retrieve current set of image model IDs.
 
     Returns:
-        set[str]: Set of model IDs supporting image generation.
+        frozenset[str]: Set of model IDs supporting image generation.
     """
     return image_model_ids_cached(cache_bucket())
 
@@ -295,7 +392,10 @@ def add_headers(response: Response) -> Response:
     Returns:
         Response: The modified Response object.
     """
-    response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
+    response.headers["Access-Control-Allow-Origin"] = config.CORS_ALLOW_ORIGIN
+
+    # 3. Strip Waitress server fingerprints
+    response.headers["Server"] = "one-min-ai-gateway"
 
     # Propagate the request ID if available
     req_id = getattr(g, "request_id", None) or str(uuid.uuid4())
@@ -309,6 +409,13 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
     Returns:
         dict[str, Any] | tuple[Response, int]: Parsed JSON dict or Flask error response.
     """
+    # 12. Improved Empty Request Body Parsing
+    if not request.data:
+        return error_response(
+            "Empty request body. Please provide a valid JSON object.",
+            400,
+            "empty_request_body",
+        )
     try:
         data = request.get_json(force=True)
     except BadRequest:
@@ -320,6 +427,7 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
     return data
 
 
+# 9. Flexible Vision Message Payload Formats (String vs. Dict)
 def content_to_text(content: Any) -> tuple[str, list[str]]:
     """Convert OpenAI message content to prompt text and remote image URLs.
 
@@ -337,13 +445,27 @@ def content_to_text(content: Any) -> tuple[str, list[str]]:
     text: list[str] = []
     images: list[str] = []
     for part in content:
+        if isinstance(part, str):
+            text.append(part)
+            continue
         if not isinstance(part, dict):
             continue
+
+        # Extract text content if present
         if part.get("type") == "text" or "text" in part:
             text.append(str(part.get("text", "")))
+
+        # Support both {"url": "..."} dict and direct "image_url" string formats
         image_url = part.get("image_url")
-        if isinstance(image_url, dict) and image_url.get("url"):
-            images.append(str(image_url["url"]))
+        url = None
+        if isinstance(image_url, dict):
+            url = image_url.get("url")
+        elif isinstance(image_url, str):
+            url = image_url
+
+        if url:
+            images.append(str(url))
+
     return "\n".join(text), images
 
 
@@ -540,7 +662,6 @@ def upstream_error(response: requests.Response) -> tuple[Response, int]:
     except ValueError:
         body = response.text[:500]
 
-    # 10. Upstream Error Detail Parsing
     error_msg = ""
     if isinstance(body, dict):
         if "error" in body:
@@ -637,6 +758,61 @@ def is_disallowed_host(hostname: str) -> bool:
     return False
 
 
+# 1. DNS Rebinding SSRF Protection & 2. Safe Redirect Following (Multi-Hop Validation)
+def secure_fetch(
+    url: str, session: requests.Session, timeout: int = 30, max_redirects: int = 5
+) -> requests.Response:
+    """Perform a secure HTTP GET request checking DNS resolved IPs and validating redirect chains.
+
+    Args:
+        url: The starting target URL.
+        session: Persistent requests connection pool.
+        timeout: Socket and network read timeout.
+        max_redirects: Maximum allowable redirect hops.
+
+    Returns:
+        requests.Response: The successful response object.
+    """
+    current_url = url
+    for hop in range(max_redirects + 1):
+        parsed = urlparse(current_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("Only http and https schemes are permitted.")
+        if not parsed.hostname:
+            raise ValueError("URL hostname is missing.")
+
+        # 1. SSRF & DNS Rebinding validation: resolve and verify the resolved IP
+        if is_disallowed_host(parsed.hostname):
+            raise ValueError("Access to the requested host address is restricted.")
+
+        # 2. Execute connection with redirects disabled to allow hop-by-hop checking
+        response = session.get(
+            current_url,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+            verify=config.GATEWAY_VERIFY_SSL,
+        )
+
+        # 3. Handle redirects manually
+        if 300 <= response.status_code < 400:
+            if hop >= max_redirects:
+                raise ValueError("Too many redirect hops detected.")
+
+            location = response.headers.get("Location")
+            if not location:
+                raise ValueError("Redirect response did not provide a Location header.")
+
+            # Resolve relative redirects cleanly
+            current_url = urljoin(current_url, location)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    raise ValueError("Too many redirect hops detected.")
+
+
 def validate_messages(messages: Any) -> tuple[Response, int] | None:
     """Verify standard schema and format of messages list.
 
@@ -678,13 +854,13 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
         return error_response("Invalid base64 image data.", 400, "invalid_image")
-    if len(payload) > MAX_IMAGE_BYTES:
+    if len(payload) > config.MAX_IMAGE_BYTES:
         return error_response("Image payload is too large.", 413, "image_too_large")
     return BytesIO(payload)
 
 
 def fetch_remote_image(image_url: str) -> BytesIO | tuple[Response, int]:
-    """Fetch remote HTTP/HTTPS image safely avoiding internal network lookups.
+    """Fetch remote HTTP/HTTPS image safely using secure multi-hop DNS protection.
 
     Args:
         image_url: Remote web address.
@@ -692,39 +868,22 @@ def fetch_remote_image(image_url: str) -> BytesIO | tuple[Response, int]:
     Returns:
         BytesIO | tuple[Response, int]: Downloaded image buffer, or error response.
     """
-    parsed = urlparse(image_url)
-    if parsed.scheme not in {"http", "https"}:
-        return error_response(
-            "Image URL must use http or https.", 400, "invalid_image_url"
-        )
-    if not parsed.hostname:
-        return error_response("Invalid image URL.", 400, "invalid_image_url")
-    if is_disallowed_host(parsed.hostname):
-        return error_response(
-            "Image URL host is not allowed.", 400, "invalid_image_url"
-        )
-
     try:
-        # Use connection pool session
-        fetched = get_session().get(
-            image_url,
-            timeout=30,
-            stream=True,
-            allow_redirects=False,
-            verify=GATEWAY_VERIFY_SSL,
+        # Use our secure custom DNS redirect-following fetch wrapper
+        fetched = secure_fetch(image_url, get_session(), timeout=30, max_redirects=5)
+    except ValueError as exc:
+        logger.warning("failed to fetch image URL securely: %s", exc)
+        return error_response(
+            f"Could not fetch image URL: {exc}", 400, "invalid_image_url"
         )
-        fetched.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("failed to fetch image URL: %s", exc)
-        return error_response("Could not fetch image URL.", 400, "invalid_image_url")
-
-    if 300 <= fetched.status_code < 400:
         return error_response("Could not fetch image URL.", 400, "invalid_image_url")
 
     content_length = fetched.headers.get("Content-Length")
     if content_length:
         try:
-            if int(content_length) > MAX_IMAGE_BYTES:
+            if int(content_length) > config.MAX_IMAGE_BYTES:
                 return error_response(
                     "Image payload is too large.", 413, "image_too_large"
                 )
@@ -736,7 +895,7 @@ def fetch_remote_image(image_url: str) -> BytesIO | tuple[Response, int]:
         if not chunk:
             continue
         data.write(chunk)
-        if data.tell() > MAX_IMAGE_BYTES:
+        if data.tell() > config.MAX_IMAGE_BYTES:
             return error_response("Image payload is too large.", 413, "image_too_large")
     data.seek(0)
     return data
@@ -773,13 +932,13 @@ def upload_images(
         if isinstance(binary_data, tuple):
             return binary_data
 
-        # Use connection pool session
+        # Use connection pool session and propagated headers
         upload = get_session().post(
-            ASSET_API_URL,
+            asset_api_url(),
             files={"asset": (f"gateway-{uuid.uuid4()}.png", binary_data, "image/png")},
-            headers={"API-KEY": api_key},
+            headers={"API-KEY": api_key, **propagated_headers()},
             timeout=60,
-            verify=GATEWAY_VERIFY_SSL,
+            verify=config.GATEWAY_VERIFY_SSL,
         )
         if upload.status_code != 200:
             return upstream_error(upload)
@@ -810,7 +969,14 @@ def build_payload(
     if validation is not None:
         return validation
 
-    model = data.get("model", DEFAULT_CHAT_MODEL)
+    model = data.get("model", config.DEFAULT_CHAT_MODEL)
+
+    # 19. Enhanced Model Warning Traces
+    if model not in {model_id(m) for m in chat_models() if model_id(m)}:
+        logger.warning(
+            "Requested model '%s' is not listed in active models catalog.", model
+        )
+
     prompt, image_urls = format_messages(messages)
     prompt += tool_prompt(data.get("tools") or [], has_tool_result(messages))
 
@@ -844,19 +1010,33 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 
+# 11. Accurate Optional Token Counting (tiktoken)
+try:
+    import tiktoken
+
+    _encoder = tiktoken.get_encoding("cl100k_base")
+except ImportError:
+    _encoder = None
+
+
 def token_count(text: str) -> int:
-    """Estimate token count for response metric tracking.
+    """Estimate or accurately calculate the token count for response metrics tracking.
 
     Args:
         text: Core input string.
 
     Returns:
-        int: Estimated token count integer.
+        int: The token count integer.
     """
+    if _encoder is not None:
+        try:
+            return len(_encoder.encode(text, disallowed_special=()))
+        except Exception:
+            pass
     return max(1, len(text) // 4)
 
 
-# 3. Application Factory Blueprint
+# 3. Application Factory Blueprint & 10. Trailing Slashes support
 bp = Blueprint("gateway", __name__)
 
 
@@ -911,10 +1091,9 @@ def chat_completions() -> tuple[Response, int] | Response:
     Returns:
         tuple[Response, int] | Response: Completion output or chunked EventStream.
     """
-    # Note: OPTIONS is also handled globally by before_request but kept for interface completeness
     if request.method == "OPTIONS":
         response = make_response()
-        response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
+        response.headers["Access-Control-Allow-Origin"] = config.CORS_ALLOW_ORIGIN
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         return response, 204
@@ -930,17 +1109,21 @@ def chat_completions() -> tuple[Response, int] | Response:
     if isinstance(payload, tuple):
         return payload
 
-    headers = {"API-KEY": api_key, "Content-Type": "application/json"}
-    model = data.get("model", DEFAULT_CHAT_MODEL)
+    headers = {
+        "API-KEY": api_key,
+        "Content-Type": "application/json",
+        **propagated_headers(),
+    }
+    model = data.get("model", config.DEFAULT_CHAT_MODEL)
     if data.get("stream"):
         # Use connection pool session
         upstream = get_session().post(
-            CHAT_STREAM_API_URL,
+            chat_stream_api_url(),
             data=json.dumps(payload),
             headers=headers,
             stream=True,
             timeout=180,
-            verify=GATEWAY_VERIFY_SSL,
+            verify=config.GATEWAY_VERIFY_SSL,
         )
         if upstream.status_code != 200:
             return upstream_error(upstream)
@@ -950,11 +1133,11 @@ def chat_completions() -> tuple[Response, int] | Response:
 
     # Use connection pool session
     upstream = get_session().post(
-        CHAT_API_URL,
+        chat_api_url(),
         json=payload,
         headers=headers,
         timeout=180,
-        verify=GATEWAY_VERIFY_SSL,
+        verify=config.GATEWAY_VERIFY_SSL,
     )
     if upstream.status_code != 200:
         return upstream_error(upstream)
@@ -996,7 +1179,7 @@ def chat_completions() -> tuple[Response, int] | Response:
 def stream_response(
     upstream: requests.Response, data: dict[str, Any], model: str
 ) -> Generator[str, None, None]:
-    """Stream response back to client with robust tool call buffering protection.
+    """Stream response back to client with robust tool call buffering protection and standard OpenAI formats.
 
     Args:
         upstream: Stream response object from 1min.ai.
@@ -1011,8 +1194,6 @@ def stream_response(
     current_event = None
     stream_id = f"chatcmpl-{uuid.uuid4()}"
     tools = data.get("tools") or []
-
-    # 1. Dynamic Tool Call Streaming Truncation (Parser Buffering)
     in_tool_buffering = False
 
     def emit_content_chunk(content: str, finish_reason: str | None = None) -> str:
@@ -1095,9 +1276,18 @@ def stream_response(
             continue
         try:
             parsed = json.loads(raw_data)
-            content = (
-                parsed.get("content") or parsed.get("delta", {}).get("content") or ""
-            )
+
+            # 8. Robust OpenAI Stream Chunk Schema Support
+            choices = parsed.get("choices")
+            if isinstance(choices, list) and choices:
+                delta = choices[0].get("delta", {})
+                content = delta.get("content") or ""
+            else:
+                content = (
+                    parsed.get("content")
+                    or parsed.get("delta", {}).get("content")
+                    or ""
+                )
         except json.JSONDecodeError:
             content = raw_data
 
@@ -1118,10 +1308,8 @@ def stream_response(
                         yield "data: [DONE]\n\n"
                         return
                     else:
-                        # Found closing tag but not a valid tool call, disable special buffering to flush
                         in_tool_buffering = False
                 elif len(buffered_text) > 8000:
-                    # Safety threshold limit exceeded, disable tool buffering to flush
                     in_tool_buffering = False
 
             if not in_tool_buffering:
@@ -1164,10 +1352,9 @@ def image_generations() -> tuple[Response, int]:
     Returns:
         tuple[Response, int]: List of generated asset URLs.
     """
-    # Note: OPTIONS is also handled globally by before_request but kept for interface completeness
     if request.method == "OPTIONS":
         response = make_response()
-        response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
+        response.headers["Access-Control-Allow-Origin"] = config.CORS_ALLOW_ORIGIN
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         return response, 204
@@ -1179,7 +1366,7 @@ def image_generations() -> tuple[Response, int]:
     data = request_json()
     if isinstance(data, tuple):
         return data
-    model = data.get("model", DEFAULT_IMAGE_MODEL)
+    model = data.get("model", config.DEFAULT_IMAGE_MODEL)
     if model not in image_model_ids():
         return error_response(
             f"This model does not support image generation: {model}",
@@ -1191,9 +1378,9 @@ def image_generations() -> tuple[Response, int]:
     if not prompt:
         return error_response("No prompt provided.", 400, "invalid_request_error")
 
-    # Use connection pool session
+    # Use connection pool session and custom header propagation
     upstream = get_session().post(
-        FEATURE_API_URL + "?isStreaming=false",
+        feature_api_url() + "?isStreaming=false",
         json={
             "type": "IMAGE_GENERATOR",
             "model": model,
@@ -1203,9 +1390,13 @@ def image_generations() -> tuple[Response, int]:
                 "size": data.get("size", "1024x1024"),
             },
         },
-        headers={"API-KEY": api_key, "Content-Type": "application/json"},
+        headers={
+            "API-KEY": api_key,
+            "Content-Type": "application/json",
+            **propagated_headers(),
+        },
         timeout=180,
-        verify=GATEWAY_VERIFY_SSL,
+        verify=config.GATEWAY_VERIFY_SSL,
     )
     if upstream.status_code != 200:
         return upstream_error(upstream)
@@ -1232,6 +1423,7 @@ def create_app() -> Flask:
         Flask: Configured Flask application.
     """
     app = Flask(__name__)
+    app.url_map.strict_slashes = False
 
     # 11. Relocate global logging initialization inside create_app
     configure_logging()
@@ -1241,7 +1433,7 @@ def create_app() -> Flask:
     def handle_options_preflight() -> Response | None:
         if request.method == "OPTIONS":
             response = make_response()
-            response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
+            response.headers["Access-Control-Allow-Origin"] = config.CORS_ALLOW_ORIGIN
             response.headers["Access-Control-Allow-Headers"] = (
                 "Content-Type,Authorization"
             )
@@ -1290,11 +1482,15 @@ def create_app() -> Flask:
 # Maintain backward compatibility with WSGI imports
 app = create_app()
 
+
+# 15. CLI Entrypoint Script (one-min-ai-gateway)
+def main() -> None:
+    """CLI entrypoint function for running the gateway."""
+    logger.info(
+        "one-min-ai-gateway starting on %s:%s via CLI", config.HOST, config.PORT
+    )
+    serve(app, host=config.HOST, port=config.PORT, threads=config.WAITRESS_THREADS)
+
+
 if __name__ == "__main__":
-    logger.info("one-min-ai-gateway listening on %s:%s", HOST, PORT)
-    try:
-        threads_conf = int(os.getenv("WAITRESS_THREADS", "8"))
-    except ValueError:
-        # 9. Hardcoded Waitress Server Thread Concurrency
-        threads_conf = 8
-    serve(app, host=HOST, port=PORT, threads=threads_conf)
+    main()

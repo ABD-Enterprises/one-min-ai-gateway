@@ -11,15 +11,18 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "deffenda" }]
 dependencies = [
-  "flask>=3.0",
-  "requests>=2.31",
-  "waitress>=3.0",
+  "flask>=3.0,<4.0",
+  "requests>=2.31,<3.0",
+  "waitress>=3.0,<4.0",
 ]
 
 [project.optional-dependencies]
 test = [
-  "pytest>=8.0",
+  "pytest>=8.0,<10.0",
 ]
+
+[project.scripts]
+one-min-ai-gateway = "server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
