@@ -44,8 +44,8 @@ network-denied container sandbox when Docker or Podman is available. If ORC fall
 or production credentials, and treat the warning as a security exception to remove before accepting
 untrusted public PRs.
 
-See [Validation Isolation](docs/security/validation-isolation.md) for the container-vs-host
-trade-off and the recommended public-repo posture.
+See the ORC validation isolation documentation for the container-vs-host trade-off and the
+recommended public-repo posture.
 
 ## Safe Harbor
 
