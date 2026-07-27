@@ -26,6 +26,9 @@ test = [
 [project.scripts]
 one-min-ai-gateway = "server:main"
 
+[tool.setuptools]
+py-modules = ["server"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
