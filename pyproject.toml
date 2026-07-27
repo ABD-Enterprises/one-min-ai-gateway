@@ -20,11 +20,15 @@ dependencies = [
 test = [
   "pytest>=8.0,<10.0",
   "mypy>=1.8,<2.0",
+  "ruff>=0.12,<1.0",
   "types-requests>=2.31,<3.0",
 ]
 
 [project.scripts]
 one-min-ai-gateway = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
