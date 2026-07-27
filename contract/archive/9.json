@@ -1,0 +1,88 @@
+{
+  "schema": "orc.contract-archive.v1",
+  "ticket": "9",
+  "provenance": {
+    "pr": null,
+    "head_sha": null,
+    "done_when_total": 3,
+    "machine_backed": 0,
+    "checks": 0,
+    "satisfied": 0,
+    "class_counts": {
+      "machine_check": 0,
+      "human_evidence": 0,
+      "explicitly_self_attested": 3
+    },
+    "classified_ratio": 0,
+    "clauses": [
+      {
+        "index": 1,
+        "text": "The distribution explicitly packages server.py as the server module.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      },
+      {
+        "index": 2,
+        "text": "Editable installation succeeds when contract/archive exists.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      },
+      {
+        "index": 3,
+        "text": "Ruff, mypy, and all application tests pass.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      }
+    ]
+  },
+  "contract": {
+    "scope": [
+      "pyproject.toml setuptools module-discovery configuration only"
+    ],
+    "depends_on": [],
+    "done_when": [
+      "The distribution explicitly packages server.py as the server module.",
+      "Editable installation succeeds when contract/archive exists.",
+      "Ruff, mypy, and all application tests pass."
+    ],
+    "validation": {
+      "local": [
+        "python -m pip install -e '.[test]'",
+        "python -m ruff check .",
+        "python -m ruff format --check .",
+        "python -m mypy .",
+        "python -m pytest"
+      ],
+      "review": []
+    },
+    "user_story": {
+      "user": "Maintainer",
+      "problem": "Metadata directories can change setuptools auto-discovery and break otherwise valid builds.",
+      "desired_outcome": "Packaging is deterministic and includes only the gateway module.",
+      "acceptance_examples": [
+        "A tracked contract/archive JSON file does not affect editable installation."
+      ],
+      "non_goals": [
+        "Do not move source files, adopt a src layout, or change runtime dependencies."
+      ],
+      "outcome_evidence": "Green local installation and CI on the focused PR."
+    },
+    "references": [
+      "GitHub Actions run 30314581426",
+      "ABD-Enterprises/orc#2684"
+    ],
+    "surfaces": [
+      "Python distribution metadata"
+    ],
+    "artifact_expectations": [],
+    "review_points": [
+      "Confirm `server.py` remains importable and the console-script target is unchanged."
+    ]
+  }
+}
