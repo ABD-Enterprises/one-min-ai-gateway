@@ -1,0 +1,111 @@
+{
+  "schema": "orc.contract-archive.v1",
+  "ticket": "6",
+  "provenance": {
+    "pr": null,
+    "head_sha": null,
+    "done_when_total": 4,
+    "machine_backed": 0,
+    "checks": 0,
+    "satisfied": 0,
+    "class_counts": {
+      "machine_check": 0,
+      "human_evidence": 0,
+      "explicitly_self_attested": 4
+    },
+    "classified_ratio": 0,
+    "clauses": [
+      {
+        "index": 1,
+        "text": "The current ORC generator renders the supported v7.17.0 adopter bundle without hand edits.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      },
+      {
+        "index": 2,
+        "text": "ORC's pipeline invariant passes.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      },
+      {
+        "index": 3,
+        "text": "The repository's application lint, type-check, and test suite pass.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      },
+      {
+        "index": 4,
+        "text": "Stale duplicate PRs #3 and #4 are closed with a successor breadcrumb.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      }
+    ]
+  },
+  "contract": {
+    "scope": [
+      ".gemini/config.yaml",
+      ".github/PULL_REQUEST_TEMPLATE.md",
+      ".github/workflows/orc-ai-approver.yml",
+      ".github/workflows/orc-code-guards.yml",
+      ".github/workflows/orc-fleet-baseline.yml",
+      ".github/workflows/orc-merge-override-note.yml",
+      ".github/workflows/orc-merge-queue.yml",
+      ".github/workflows/orc-pr-size-label.yml",
+      ".github/workflows/orc-risk-label.yml",
+      ".github/workflows/orc-run-presence.yml",
+      ".github/workflows/orc-superseded-check.yml"
+    ],
+    "depends_on": [],
+    "done_when": [
+      "The current ORC generator renders the supported v7.17.0 adopter bundle without hand edits.",
+      "ORC's pipeline invariant passes.",
+      "The repository's application lint, type-check, and test suite pass.",
+      "Stale duplicate PRs #3 and #4 are closed with a successor breadcrumb."
+    ],
+    "validation": {
+      "local": [
+        "node /Users/deffenda/Code/orc/tools/validators/enforce-pipeline.mjs --repo .",
+        "python -m pip install -e '.[test]'",
+        "python -m ruff check .",
+        "python -m ruff format --check .",
+        "python -m mypy .",
+        "python -m pytest"
+      ],
+      "review": []
+    },
+    "user_story": {
+      "user": "Repository maintainer",
+      "problem": "Legacy ORC workflow pins make the repository fail its current local governance gate.",
+      "desired_outcome": "One supported, reviewable adopter bundle replaces the stale duplicate refreshes.",
+      "acceptance_examples": [
+        "The pipeline invariant exits zero and no generated workflow references the legacy commit SHA."
+      ],
+      "non_goals": [
+        "Do not change application code, application dependencies, or GitHub repository policy."
+      ],
+      "outcome_evidence": "Green ORC validation and required checks on the replacement PR."
+    },
+    "references": [
+      "PR #3",
+      "PR #4"
+    ],
+    "surfaces": [
+      "GitHub Actions governance workflows",
+      "ORC-generated pull request and Gemini configuration"
+    ],
+    "artifact_expectations": [],
+    "review_points": [
+      "Generated provenance and v7.17.0 pin",
+      "Workflow permissions and private-engine fetch behavior",
+      "No application code or dependency changes"
+    ]
+  }
+}
