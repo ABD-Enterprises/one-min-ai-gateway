@@ -1,0 +1,78 @@
+{
+  "schema": "orc.contract-archive.v1",
+  "ticket": "5",
+  "provenance": {
+    "pr": null,
+    "head_sha": null,
+    "done_when_total": 2,
+    "machine_backed": 0,
+    "checks": 0,
+    "satisfied": 0,
+    "class_counts": {
+      "machine_check": 0,
+      "human_evidence": 0,
+      "explicitly_self_attested": 2
+    },
+    "classified_ratio": 0,
+    "clauses": [
+      {
+        "index": 1,
+        "text": "A clean installation of .[test] provides Ruff.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      },
+      {
+        "index": 2,
+        "text": "The existing lint, format, type-check, and test commands pass.",
+        "backed": false,
+        "satisfied": null,
+        "evidence": null,
+        "class": "explicitly_self_attested"
+      }
+    ]
+  },
+  "contract": {
+    "scope": [
+      "pyproject.toml test optional dependency only"
+    ],
+    "depends_on": [],
+    "done_when": [
+      "A clean installation of .[test] provides Ruff.",
+      "The existing lint, format, type-check, and test commands pass."
+    ],
+    "validation": {
+      "local": [
+        "python -m pip install -e '.[test]'",
+        "python -m ruff check .",
+        "python -m ruff format --check .",
+        "python -m mypy .",
+        "python -m pytest"
+      ],
+      "review": []
+    },
+    "user_story": {
+      "user": "Maintainer",
+      "problem": "CI invokes a development tool that the declared test toolchain does not install.",
+      "desired_outcome": "A clean test-extra install reproduces the complete CI toolchain.",
+      "acceptance_examples": [
+        "After installing .[test], `ruff --version` succeeds without a separate install step."
+      ],
+      "non_goals": [
+        "Do not alter application dependencies, CI topology, or ORC-managed workflows."
+      ],
+      "outcome_evidence": "Successful local ORC validation and green CI on the focused PR."
+    },
+    "references": [
+      "GitHub Actions run 28997170017"
+    ],
+    "surfaces": [
+      "Python test/development dependency installation"
+    ],
+    "artifact_expectations": [],
+    "review_points": [
+      "Confirm the Ruff range is bounded and compatible with the repository's current formatting."
+    ]
+  }
+}
