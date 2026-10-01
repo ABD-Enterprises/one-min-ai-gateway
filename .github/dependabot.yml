@@ -11,3 +11,34 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]
+    labels: ["dependencies"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      # A Python minor bump is a runtime jump; handle it deliberately.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor"]
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    groups:
+      pip:
+        patterns: ["*"]
+    labels: ["dependencies"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
