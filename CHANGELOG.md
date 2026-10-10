@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners
+  (`LINUX_RUNNER_LABELS`) and stop persisting checkout credentials.
+
 ## 0.1.1
 
 - Hardened image fetch path against private-network/localhost hosts.
