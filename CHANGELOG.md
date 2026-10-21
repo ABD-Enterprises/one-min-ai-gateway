@@ -4,6 +4,8 @@
 
 - [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners
   (`LINUX_RUNNER_LABELS`) and stop persisting checkout credentials.
+- [INTERNAL] Adopt the fleet agent-file standard: `AGENTS.md` with the shared core and
+  repository rules, and a `CLAUDE.md` that only imports it.
 
 ## 0.1.1
 
