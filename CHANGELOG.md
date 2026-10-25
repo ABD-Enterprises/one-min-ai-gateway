@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- [INTERNAL] Refresh the generated fleet core; preserve repository-specific instructions.
+
 - [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners
   (`LINUX_RUNNER_LABELS`) and stop persisting checkout credentials.
 - [INTERNAL] Adopt the fleet agent-file standard: `AGENTS.md` with the shared core and
