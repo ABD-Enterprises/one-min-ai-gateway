@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- [SECURITY] Error responses no longer echo exception text: the global handler returns
+  the status's standard reason phrase and image-fetch failures a fixed message (the
+  detail stays in the log), and every response carries `X-Content-Type-Options: nosniff`.
 - [INTERNAL] Refresh the generated fleet core; preserve repository-specific instructions.
 
 - [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners

@@ -344,9 +344,20 @@ def test_global_json_error_handler():
         response = client.get("/v1/models")
         assert response.status_code == 500
         assert response.json["error"]["type"] == "server_error"
-        assert "Database failure" in response.json["error"]["message"]
+        # The exception text is logged, not returned: it can carry internals.
+        assert response.json["error"]["message"] == "Internal Server Error"
+        assert "Database failure" not in response.get_data(as_text=True)
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
     finally:
         server.chat_models = original_chat_models
+
+
+def test_http_exception_keeps_status_and_reason_phrase_only():
+    client = server.app.test_client()
+    response = client.get("/no-such-route")
+    assert response.status_code == 404
+    assert response.json["error"]["message"] == "Not Found"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
 def test_upstream_error_detailed_parsing(monkeypatch):

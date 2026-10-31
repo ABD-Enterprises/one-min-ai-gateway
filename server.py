@@ -30,7 +30,8 @@ from flask import (
     g,
     has_request_context,
 )
-from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import BadRequest, HTTPException
+from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
 
@@ -396,6 +397,8 @@ def add_headers(response: Response) -> Response:
 
     # 3. Strip Waitress server fingerprints
     response.headers["Server"] = "one-min-ai-gateway"
+    # Every body is JSON; stop browsers from sniffing a response into another type.
+    response.headers["X-Content-Type-Options"] = "nosniff"
 
     # Propagate the request ID if available
     req_id = getattr(g, "request_id", None) or str(uuid.uuid4())
@@ -873,9 +876,7 @@ def fetch_remote_image(image_url: str) -> BytesIO | tuple[Response, int]:
         fetched = secure_fetch(image_url, get_session(), timeout=30, max_redirects=5)
     except ValueError as exc:
         logger.warning("failed to fetch image URL securely: %s", exc)
-        return error_response(
-            f"Could not fetch image URL: {exc}", 400, "invalid_image_url"
-        )
+        return error_response("Could not fetch image URL.", 400, "invalid_image_url")
     except requests.RequestException as exc:
         logger.warning("failed to fetch image URL: %s", exc)
         return error_response("Could not fetch image URL.", 400, "invalid_image_url")
@@ -1470,9 +1471,12 @@ def create_app() -> Flask:
     def handle_exception(exc: Exception) -> tuple[Response, int]:
         logger.exception("Unhandled error occurred in gateway: %s", exc)
         status_code = 500
-        if hasattr(exc, "code") and isinstance(exc.code, int):
+        if isinstance(exc, HTTPException) and isinstance(exc.code, int):
             status_code = exc.code
-        message = str(exc)
+        # The exception text stays in the log: for an unexpected error it can
+        # carry internals (paths, upstream bodies), so the client gets the
+        # standard reason phrase for the status only.
+        message = HTTP_STATUS_CODES.get(status_code, "Internal Server Error")
         return error_response(message, status_code, "server_error")
 
     app.register_blueprint(bp)
