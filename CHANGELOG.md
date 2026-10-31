@@ -3,6 +3,7 @@
 ## Unreleased
 
 - [INTERNAL] Refresh the generated fleet core; preserve repository-specific instructions.
+- [INTERNAL] CI hygiene: both `ci.yml` jobs have a `timeout-minutes` sized from their recorded run times, a superseded pull-request run is cancelled (push and tag runs never are), and the runner fallback no longer pins a chip.
 
 - [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners
   (`LINUX_RUNNER_LABELS`) and stop persisting checkout credentials.

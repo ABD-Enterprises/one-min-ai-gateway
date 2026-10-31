@@ -11,9 +11,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Supersede an in-flight pull-request run only. A push to main or a v* tag
+  # publishes the image, so those runs are never cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["self-hosted","Linux","ARM64","docker"]') }}
+    # The fallback is chip-neutral: the self-hosted pool is served by more than one architecture.
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["self-hosted","Linux","docker"]') }}
+    # Measured 2026-10-31 over the last 17 successful runs: at most 0.6 min of running time.
+    timeout-minutes: 10
     steps:
       - name: Start with fresh Git metadata on self-hosted runners
         working-directory: ${{ runner.temp }}
@@ -39,7 +48,10 @@ jobs:
   publish-image:
     if: github.event_name == 'push'
     needs: test
-    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["self-hosted","Linux","ARM64","docker"]') }}
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["self-hosted","Linux","docker"]') }}
+    # Measured 2026-10-31 over the last 8 successful runs: at most 4.0 min of running time
+    # (median 2.2). The arm64 half of the build runs under QEMU, so the headroom is wider.
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
