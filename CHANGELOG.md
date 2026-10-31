@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- [INTERNAL] Regenerate the fleet-core block in `AGENTS.md` to the current standard.
 - [INTERNAL] Refresh the generated fleet core; preserve repository-specific instructions.
 
 - [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners
