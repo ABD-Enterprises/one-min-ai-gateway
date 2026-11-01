@@ -106,4 +106,5 @@ guarantee of native tool calling support from every model.
 ## Image Publishing
 
 Pushes to `main` publish `ghcr.io/abd-enterprises/one-min-ai-gateway:latest`
-and a commit-SHA tag.
+and a `sha-<commit>` tag; pushing a `v*` tag also publishes `X.Y.Z` and `X.Y`
+tags. Images are built for `linux/amd64` and `linux/arm64`.

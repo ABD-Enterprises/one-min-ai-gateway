@@ -5,7 +5,9 @@
 - [SECURITY] Error responses no longer echo exception text: the global handler returns
   the status's standard reason phrase and image-fetch failures a fixed message (the
   detail stays in the log), and every response carries `X-Content-Type-Options: nosniff`.
+- [INTERNAL] Regenerate the fleet-core block in `AGENTS.md` to the current standard.
 - [INTERNAL] Refresh the generated fleet core; preserve repository-specific instructions.
+- [INTERNAL] CI hygiene: both `ci.yml` jobs have a `timeout-minutes` sized from their recorded run times, a superseded pull-request run is cancelled (push and tag runs never are), and the runner fallback is the hosted label the repository variable already holds instead of a self-hosted ARM64 pool that a public repository cannot use.
 
 - [INTERNAL] Route CI jobs to the organization's self-hosted Linux runners
   (`LINUX_RUNNER_LABELS`) and stop persisting checkout credentials.

@@ -11,9 +11,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Pull-request runs share a group per pull request, so a new push supersedes
+  # the one in flight. Every push or tag run publishes the image, so each is
+  # keyed by its run id: GitHub keeps at most one pending run per group, and
+  # sharing a group would drop a queued release even with cancel-in-progress off.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["self-hosted","Linux","ARM64","docker"]') }}
+    # The fallback is the value the repository variable holds. This repository is
+    # public, and no self-hosted runner group admits public repositories, so a
+    # self-hosted fallback would queue forever.
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Measured 2026-10-31 over the last 17 successful runs: at most 0.6 min of running time.
+    timeout-minutes: 10
     steps:
       - name: Start with fresh Git metadata on self-hosted runners
         working-directory: ${{ runner.temp }}
@@ -39,7 +52,10 @@ jobs:
   publish-image:
     if: github.event_name == 'push'
     needs: test
-    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["self-hosted","Linux","ARM64","docker"]') }}
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Measured 2026-10-31 over the last 8 successful runs: at most 4.0 min of running time
+    # (median 2.2). The arm64 half of the build runs under QEMU, so the headroom is wider.
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
