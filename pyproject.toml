@@ -41,3 +41,8 @@ warn_unused_configs = true
 warn_unused_ignores = true
 disable_error_code = ["import-untyped"]
 exclude = ["tests/"]
+
+[tool.ruff.lint]
+# Keep the rule set that ruff applied by default through 0.15 (ruff 0.17 reports more by
+# default). Adopting the wider set means fixing the findings it reports, which is a separate change.
+select = ["E4", "E7", "E9", "F"]
