@@ -13,6 +13,8 @@ authors = [{ name = "deffenda" }]
 dependencies = [
   "flask>=3.0,<4.0",
   "requests>=2.31,<3.0",
+  # server.py imports the urllib3 2.x connection API directly.
+  "urllib3>=2.0,<3.0",
   "waitress>=3.0,<4.0",
 ]
 

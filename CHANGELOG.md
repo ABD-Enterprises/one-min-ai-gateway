@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- [INTERNAL] Declare `urllib3>=2.0,<3.0` as a direct dependency: the image-fetch transport uses the urllib3 2.x API (`requests>=2.31` accepts urllib3 2.x).
+- [SECURITY] Harden the outbound host check for fetched image URLs: any address that is not publicly routable is refused (including the shared address range and IPv6 forms that carry an IPv4 address), every resolved address is checked, a failed lookup refuses the host, image fetches connect only to an address from the same lookup that was checked (TLS still verifies the URL's hostname), URLs with backslashes, whitespace or control characters or with a host the two URL parsers read differently are refused on every redirect hop, image fetches ignore proxy settings from the environment, and a response whose Content-Type is not an image is refused.
 - [INTERNAL] Lint keeps the rule set ruff applied by default through 0.15 (`select = ["E4", "E7", "E9", "F"]`), so the widened `ruff<0.18` and `mypy<3.0` ranges do not fail CI on 17 new default-rule findings.
 - [SECURITY] Error responses no longer echo exception text: the global handler returns
   the status's standard reason phrase and image-fetch failures a fixed message (the

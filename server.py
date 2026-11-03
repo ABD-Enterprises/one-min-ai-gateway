@@ -20,6 +20,15 @@ from typing import Any, Generator
 from urllib.parse import urlparse, urljoin
 
 import requests
+import urllib3
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    NameResolutionError,
+    NewConnectionError,
+)
+from urllib3.util.connection import allowed_gai_family
 from flask import (
     Flask,
     Response,
@@ -137,6 +146,11 @@ def get_session() -> requests.Session:
 def close_session() -> None:
     """Cleanly close the global persistent requests Session on shutdown."""
     global _session
+    if _image_session is not None:
+        try:
+            _image_session.close()
+        except Exception:
+            pass
     if _session is not None:
         try:
             _session.close()
@@ -706,14 +720,74 @@ def response_json(response: requests.Response) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+_IPV4_COMPATIBLE_PREFIX = ipaddress.ip_network("::/96")
+_IPV4_TRANSLATED_PREFIX = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address an IPv6 address stands in for, if any.
+
+    Covers IPv4-mapped, IPv4-compatible, IPv4-translated and NAT64
+    (well-known prefix) forms, whose only meaning is the IPv4 address.
+
+    Args:
+        ip: Parsed IPv6 address.
+
+    Returns:
+        IPv4Address | None: The embedded IPv4 address, or None.
+    """
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if (
+        ip in _NAT64_PREFIX
+        or ip in _IPV4_COMPATIBLE_PREFIX
+        or ip in _IPV4_TRANSLATED_PREFIX
+    ):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def is_disallowed_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True unless an address is publicly routable.
+
+    Anything ``ipaddress`` does not report as global is refused, which covers
+    loopback, private, link-local, shared (carrier-grade NAT), reserved and
+    documentation ranges. IPv6 forms that stand in for an IPv4 address are
+    judged by that IPv4 address; 6to4 and Teredo addresses must also carry a
+    public IPv4 address.
+
+    Args:
+        ip: Parsed IPv4 or IPv6 address.
+
+    Returns:
+        bool: True if the address must not be fetched.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        inner = embedded_ipv4(ip)
+        if inner is not None:
+            return is_disallowed_address(inner)
+    if not ip.is_global or ip.is_multicast or ip.is_unspecified:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.sixtofour is not None and is_disallowed_address(ip.sixtofour):
+            return True
+        if ip.teredo is not None and is_disallowed_address(ip.teredo[1]):
+            return True
+    return False
+
+
 def is_disallowed_host(hostname: str) -> bool:
-    """Validate remote hostname against DNS and loopback/private range bypass.
+    """Validate remote hostname against DNS and non-public address bypass.
+
+    Every address the hostname resolves to is checked; one non-public answer
+    is enough to refuse the host.
 
     Args:
         hostname: Input host address string.
 
     Returns:
-        bool: True if hostname resolves to private ranges or is disallowed.
+        bool: True if hostname resolves to a non-public address or is disallowed.
     """
     normalized = (hostname or "").strip().lower().strip("[]")
     if not normalized:
@@ -722,54 +796,227 @@ def is_disallowed_host(hostname: str) -> bool:
         return True
 
     try:
-        ip = ipaddress.ip_address(normalized)
-        return (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        )
+        return is_disallowed_address(ipaddress.ip_address(normalized))
     except ValueError:
         pass
 
     try:
         addresses = socket.getaddrinfo(normalized, None)
-    except socket.gaierror:
-        return False
+    except (socket.gaierror, UnicodeError):
+        return True
+    if not addresses:
+        return True
 
     for _, _, _, _, sockaddr in addresses:
         if not sockaddr:
             continue
-        ip_str = str(sockaddr[0])
-        if ip_str.startswith("::ffff:"):
-            ip_str = ip_str[7:]
+        ip_str = str(sockaddr[0]).split("%", 1)[0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
-            continue
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
+            return True
+        if is_disallowed_address(ip):
             return True
     return False
 
 
-# 1. DNS Rebinding SSRF Protection & 2. Safe Redirect Following (Multi-Hop Validation)
+class DisallowedAddressError(ValueError):
+    """Raised when an outbound fetch would connect to a non-public address."""
+
+
+def guarded_create_connection(
+    address: tuple[str, int],
+    timeout: Any,
+    source_address: tuple[str, int] | None = None,
+    socket_options: Any = None,
+) -> socket.socket:
+    """Resolve a host once, refuse it unless every address is public, then connect.
+
+    The socket connects only to an address from the same lookup that was
+    checked, so a second DNS answer cannot change where the connection goes.
+
+    Args:
+        address: Host and port to connect to.
+        timeout: Socket timeout, or urllib3's default-timeout sentinel.
+        source_address: Optional local address to bind.
+        socket_options: Optional socket options to set before connecting.
+
+    Returns:
+        socket.socket: The connected socket.
+    """
+    host, port = address
+    host = host.strip("[]")
+    results = socket.getaddrinfo(host, port, allowed_gai_family(), socket.SOCK_STREAM)
+    if not results:
+        raise DisallowedAddressError("Host did not resolve to any address.")
+    for *_, sockaddr in results:
+        try:
+            ip = ipaddress.ip_address(str(sockaddr[0]).split("%", 1)[0])
+        except ValueError:
+            raise DisallowedAddressError("Host resolved to an unusable address.")
+        if is_disallowed_address(ip):
+            raise DisallowedAddressError(
+                "Access to the requested host address is restricted."
+            )
+
+    err: OSError | None = None
+    for family, socktype, proto, _, sockaddr in results:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            for option in socket_options or []:
+                sock.setsockopt(*option)
+            if isinstance(timeout, (int, float)) or timeout is None:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            err = exc
+            if sock is not None:
+                sock.close()
+    assert err is not None
+    raise err
+
+
+def _guarded_new_conn(conn: HTTPConnection) -> socket.socket:
+    try:
+        return guarded_create_connection(
+            (conn._dns_host, conn.port),
+            conn.timeout,
+            source_address=conn.source_address,
+            socket_options=conn.socket_options,
+        )
+    except socket.gaierror as exc:
+        raise NameResolutionError(conn.host, conn, exc) from exc
+    except TimeoutError as exc:
+        raise ConnectTimeoutError(
+            conn, f"Connection to {conn.host} timed out."
+        ) from exc
+    except OSError as exc:
+        raise NewConnectionError(
+            conn, f"Failed to establish a new connection: {exc}"
+        ) from exc
+
+
+class GuardedHTTPConnection(HTTPConnection):
+    """HTTP connection that only connects to a checked public address."""
+
+    def _new_conn(self) -> socket.socket:
+        return _guarded_new_conn(self)
+
+
+class GuardedHTTPSConnection(HTTPSConnection):
+    """HTTPS connection that only connects to a checked public address.
+
+    TLS server name and certificate checks still use the URL's hostname.
+    """
+
+    def _new_conn(self) -> socket.socket:
+        return _guarded_new_conn(self)
+
+
+class GuardedHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = GuardedHTTPConnection
+
+
+class GuardedHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = GuardedHTTPSConnection
+
+
+class GuardedHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Transport adapter whose connections refuse non-public addresses."""
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": GuardedHTTPConnectionPool,
+            "https": GuardedHTTPSConnectionPool,
+        }
+
+
+_image_session: requests.Session | None = None
+
+
+def get_image_session() -> requests.Session:
+    """Get the session used for caller-supplied image URLs.
+
+    It is separate from the upstream API session: its connections refuse
+    non-public addresses, and it ignores proxy settings from the environment,
+    because a proxy would make the connection-time address check meaningless.
+
+    Returns:
+        requests.Session: The image-fetch session.
+    """
+    global _image_session
+    if _image_session is None:
+        with _session_lock:
+            if _image_session is None:
+                session = requests.Session()
+                session.trust_env = False
+                adapter = GuardedHTTPAdapter(
+                    pool_connections=config.GATEWAY_POOL_CONNECTIONS,
+                    pool_maxsize=config.GATEWAY_POOL_SIZE,
+                )
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+                _image_session = session
+    return _image_session
+
+
+_URL_FORBIDDEN_CHARS = re.compile(r"[\\\s\x00-\x1f\x7f]")
+
+
+def checked_fetch_url(url: str) -> str:
+    """Validate one URL and return the exact URL the HTTP client will request.
+
+    Refuses backslashes, whitespace and control characters, and any URL where
+    the standard-library parser and the HTTP client's parser disagree about
+    the host. The host is then checked as the HTTP client reads it.
+
+    Args:
+        url: Candidate URL (the original one or a redirect target).
+
+    Returns:
+        str: The prepared URL to request.
+    """
+    if _URL_FORBIDDEN_CHARS.search(url):
+        raise ValueError("URL contains characters that are not allowed.")
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only http and https schemes are permitted.")
+    try:
+        client_host = urllib3.util.parse_url(url).host
+    except urllib3.exceptions.LocationParseError as exc:
+        raise ValueError("URL could not be parsed.") from exc
+    stdlib_host = parsed.hostname
+    if not stdlib_host or not client_host:
+        raise ValueError("URL hostname is missing.")
+    if stdlib_host.strip("[]").lower() != client_host.strip("[]").lower():
+        raise ValueError("URL host is ambiguous.")
+
+    prepared_url = requests.Request("GET", url).prepare().url
+    if not prepared_url:
+        raise ValueError("URL could not be parsed.")
+    prepared_host = urllib3.util.parse_url(prepared_url).host
+    if not prepared_host or is_disallowed_host(prepared_host):
+        raise ValueError("Access to the requested host address is restricted.")
+    return prepared_url
+
+
+# Outbound fetch of caller-supplied URLs: every hop is checked before it is
+# requested, and the guarded session connects only to addresses that pass the
+# same check (see GuardedHTTPAdapter).
 def secure_fetch(
     url: str, session: requests.Session, timeout: int = 30, max_redirects: int = 5
 ) -> requests.Response:
-    """Perform a secure HTTP GET request checking DNS resolved IPs and validating redirect chains.
+    """Perform an HTTP GET for a caller-supplied URL, checking every redirect hop.
 
     Args:
         url: The starting target URL.
-        session: Persistent requests connection pool.
+        session: Session to send with; use get_image_session() so connections
+            are pinned to checked addresses.
         timeout: Socket and network read timeout.
         max_redirects: Maximum allowable redirect hops.
 
@@ -778,26 +1025,16 @@ def secure_fetch(
     """
     current_url = url
     for hop in range(max_redirects + 1):
-        parsed = urlparse(current_url)
-        if parsed.scheme not in {"http", "https"}:
-            raise ValueError("Only http and https schemes are permitted.")
-        if not parsed.hostname:
-            raise ValueError("URL hostname is missing.")
+        request_url = checked_fetch_url(current_url)
 
-        # 1. SSRF & DNS Rebinding validation: resolve and verify the resolved IP
-        if is_disallowed_host(parsed.hostname):
-            raise ValueError("Access to the requested host address is restricted.")
-
-        # 2. Execute connection with redirects disabled to allow hop-by-hop checking
         response = session.get(
-            current_url,
+            request_url,
             timeout=timeout,
             stream=True,
             allow_redirects=False,
             verify=config.GATEWAY_VERIFY_SSL,
         )
 
-        # 3. Handle redirects manually
         if 300 <= response.status_code < 400:
             if hop >= max_redirects:
                 raise ValueError("Too many redirect hops detected.")
@@ -806,8 +1043,7 @@ def secure_fetch(
             if not location:
                 raise ValueError("Redirect response did not provide a Location header.")
 
-            # Resolve relative redirects cleanly
-            current_url = urljoin(current_url, location)
+            current_url = urljoin(request_url, location)
             continue
 
         response.raise_for_status()
@@ -873,13 +1109,25 @@ def fetch_remote_image(image_url: str) -> BytesIO | tuple[Response, int]:
     """
     try:
         # Use our secure custom DNS redirect-following fetch wrapper
-        fetched = secure_fetch(image_url, get_session(), timeout=30, max_redirects=5)
+        fetched = secure_fetch(
+            image_url, get_image_session(), timeout=30, max_redirects=5
+        )
     except ValueError as exc:
         logger.warning("failed to fetch image URL securely: %s", exc)
         return error_response("Could not fetch image URL.", 400, "invalid_image_url")
     except requests.RequestException as exc:
         logger.warning("failed to fetch image URL: %s", exc)
         return error_response("Could not fetch image URL.", 400, "invalid_image_url")
+
+    content_type = fetched.headers.get("Content-Type", "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type and not (
+        media_type.startswith("image/") or media_type == "application/octet-stream"
+    ):
+        fetched.close()
+        return error_response(
+            "Image URL did not return an image.", 400, "invalid_image_url"
+        )
 
     content_length = fetched.headers.get("Content-Length")
     if content_length:
