@@ -795,3 +795,10 @@ def test_fetch_remote_image_rejects_non_image_content_type(monkeypatch):
     assert isinstance(result, tuple)
     assert result[1] == 400
     assert result[0].json["error"]["code"] == "invalid_image_url"
+
+
+def test_urllib3_major_version_matches_declared_dependency():
+    import urllib3
+
+    assert int(urllib3.__version__.split(".")[0]) >= 2
+    assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
