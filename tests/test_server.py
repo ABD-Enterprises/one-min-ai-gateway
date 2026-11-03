@@ -25,6 +25,9 @@ class FakeHTTPResponse:
         if self.status_code >= 400:
             raise server.requests.HTTPError(f"HTTP Error {self.status_code}")
 
+    def close(self) -> None:
+        pass
+
     def iter_content(self, chunk_size: int = 1024) -> Generator[bytes, None, None]:
         yield self.text.encode("utf-8")
 
@@ -598,3 +601,197 @@ def test_is_disallowed_host_allows_all_global_resolved_addresses(monkeypatch):
         ],
     )
     assert server.is_disallowed_host("images.example.org") is False
+
+
+# --- Outbound fetch tests against a local HTTP server ---
+
+
+@pytest.fixture
+def local_http_server():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    hits: list[tuple[str, str | None]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append((self.path, self.headers.get("Host")))
+            if self.path.startswith("/redirect"):
+                self.send_response(302)
+                self.send_header("Location", "http://inner.test/next")
+                self.end_headers()
+                return
+            body = b"\x89PNG-test"
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield httpd.server_address[1], hits
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _fake_lookup(table):
+    real = server.socket.getaddrinfo
+
+    def lookup(host, port=None, *args, **kwargs):
+        if host in table:
+            answer = table[host]
+            ips = answer() if callable(answer) else answer
+            return [
+                (
+                    server.socket.AF_INET6 if ":" in ip else server.socket.AF_INET,
+                    server.socket.SOCK_STREAM,
+                    6,
+                    "",
+                    (ip, port or 0),
+                )
+                for ip in ips
+            ]
+        return real(host, port, *args, **kwargs)
+
+    return lookup
+
+
+def test_secure_fetch_refuses_backslash_in_authority(monkeypatch, local_http_server):
+    port, hits = local_http_server
+    monkeypatch.setattr(
+        server.socket,
+        "getaddrinfo",
+        _fake_lookup({"public.test": ["8.8.8.8"]}),
+    )
+    url = f"http://127.0.0.1:{port}\\@public.test/"
+    with pytest.raises(ValueError):
+        server.secure_fetch(url, server.get_session(), timeout=3)
+    assert hits == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://public.test/a b", "http://public.test/\tx", "http://public.test\x00/"],
+)
+def test_secure_fetch_refuses_whitespace_and_control_characters(monkeypatch, url):
+    monkeypatch.setattr(
+        server.socket, "getaddrinfo", _fake_lookup({"public.test": ["8.8.8.8"]})
+    )
+
+    class NoRequestSession:
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("request should not happen")
+
+    with pytest.raises(ValueError):
+        server.secure_fetch(url, NoRequestSession())
+
+
+def test_fetch_remote_image_connects_only_to_the_checked_address(
+    monkeypatch, local_http_server
+):
+    port, hits = local_http_server
+    answers = iter([["8.8.8.8"]])
+    monkeypatch.setattr(
+        server.socket,
+        "getaddrinfo",
+        _fake_lookup({"rebind.test": lambda: next(answers, ["127.0.0.1"])}),
+    )
+    with server.app.test_request_context():
+        result = server.fetch_remote_image(f"http://rebind.test:{port}/image.png")
+    assert isinstance(result, tuple)
+    assert result[1] == 400
+    assert hits == []
+
+
+def test_fetch_remote_image_rechecks_redirect_target(monkeypatch, local_http_server):
+    port, hits = local_http_server
+    monkeypatch.setattr(
+        server.socket,
+        "getaddrinfo",
+        _fake_lookup({"start.test": ["127.0.0.1"], "inner.test": ["10.0.0.1"]}),
+    )
+    allowed = server.ipaddress.ip_address("127.0.0.1")
+    original = server.is_disallowed_address
+    monkeypatch.setattr(
+        server,
+        "is_disallowed_address",
+        lambda ip: False if ip == allowed else original(ip),
+    )
+    with server.app.test_request_context():
+        result = server.fetch_remote_image(f"http://start.test:{port}/redirect")
+    assert isinstance(result, tuple)
+    assert result[1] == 400
+    assert [path for path, _host in hits] == ["/redirect"]
+
+
+def test_guarded_fetch_keeps_host_header(monkeypatch, local_http_server):
+    port, hits = local_http_server
+    monkeypatch.setattr(
+        server.socket, "getaddrinfo", _fake_lookup({"img.test": ["127.0.0.1"]})
+    )
+    allowed = server.ipaddress.ip_address("127.0.0.1")
+    original = server.is_disallowed_address
+    monkeypatch.setattr(
+        server,
+        "is_disallowed_address",
+        lambda ip: False if ip == allowed else original(ip),
+    )
+    with server.app.test_request_context():
+        result = server.fetch_remote_image(f"http://img.test:{port}/image.png")
+    assert not isinstance(result, tuple)
+    assert result.read() == b"\x89PNG-test"
+    assert hits == [("/image.png", f"img.test:{port}")]
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "64:ff9b::7f00:1",
+        "64:ff9b::a00:1",
+        "::7f00:1",
+        "::a00:1",
+        "::ffff:0:7f00:1",
+        "::ffff:0:a00:1",
+        "2002:a00:1::",
+        "2002:6440:1::",
+    ],
+)
+def test_is_disallowed_host_refuses_embedded_non_global_ipv4(address):
+    assert server.is_disallowed_host(address) is True
+
+
+def test_is_disallowed_host_allows_embedded_global_ipv4():
+    assert server.is_disallowed_host("64:ff9b::808:808") is False
+
+
+def test_is_disallowed_host_refuses_when_lookup_fails(monkeypatch):
+    def fail_lookup(*_args, **_kwargs):
+        raise server.socket.gaierror("lookup failed")
+
+    monkeypatch.setattr(server.socket, "getaddrinfo", fail_lookup)
+    assert server.is_disallowed_host("unresolvable.test") is True
+
+
+def test_fetch_remote_image_rejects_non_image_content_type(monkeypatch):
+    monkeypatch.setattr(server, "is_disallowed_host", lambda hostname: False)
+    monkeypatch.setattr(
+        server.requests.Session,
+        "get",
+        lambda *_, **__: FakeHTTPResponse(
+            status_code=200,
+            text='{"a": 1}',
+            headers={"Content-Type": "application/json"},
+        ),
+    )
+    with server.app.test_request_context():
+        result = server.fetch_remote_image("https://cdn.example.org/image.png")
+    assert isinstance(result, tuple)
+    assert result[1] == 400
+    assert result[0].json["error"]["code"] == "invalid_image_url"
