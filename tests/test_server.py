@@ -545,3 +545,56 @@ def test_cache_stampede_protection_lock():
     with server._catalog_mutex:
         assert server._catalog_mutex.locked()
     assert not server._catalog_mutex.locked()
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "100.64.0.1",
+        "100.100.1.1",
+        "100.127.255.254",
+        "::ffff:127.0.0.1",
+        "::ffff:10.0.0.1",
+        "::ffff:100.64.0.1",
+        "[::ffff:192.168.1.1]",
+        "192.0.2.10",
+    ],
+)
+def test_is_disallowed_host_refuses_non_global_literals(address):
+    assert server.is_disallowed_host(address) is True
+
+
+@pytest.mark.parametrize(
+    "address", ["8.8.8.8", "2001:4860:4860::8888", "::ffff:8.8.8.8"]
+)
+def test_is_disallowed_host_allows_global_literals(address):
+    assert server.is_disallowed_host(address) is False
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        ["8.8.8.8", "100.64.0.1"],
+        ["100.100.100.100"],
+        ["2001:4860:4860::8888", "::ffff:10.0.0.1"],
+    ],
+)
+def test_is_disallowed_host_checks_every_resolved_address(monkeypatch, resolved):
+    monkeypatch.setattr(
+        server.socket,
+        "getaddrinfo",
+        lambda hostname, *_args, **_kwargs: [(0, 0, 0, "", (ip, 0)) for ip in resolved],
+    )
+    assert server.is_disallowed_host("images.example.org") is True
+
+
+def test_is_disallowed_host_allows_all_global_resolved_addresses(monkeypatch):
+    monkeypatch.setattr(
+        server.socket,
+        "getaddrinfo",
+        lambda hostname, *_args, **_kwargs: [
+            (0, 0, 0, "", ("8.8.8.8", 0)),
+            (0, 0, 0, "", ("2001:4860:4860::8888", 0, 0, 0)),
+        ],
+    )
+    assert server.is_disallowed_host("images.example.org") is False

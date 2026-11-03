@@ -706,14 +706,38 @@ def response_json(response: requests.Response) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def is_disallowed_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True unless an address is publicly routable.
+
+    Anything ``ipaddress`` does not report as global is refused, which covers
+    loopback, private, link-local, shared (carrier-grade NAT), reserved and
+    documentation ranges. IPv4-mapped IPv6 addresses are judged by the IPv4
+    address they carry.
+
+    Args:
+        ip: Parsed IPv4 or IPv6 address.
+
+    Returns:
+        bool: True if the address must not be fetched.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            ip = mapped
+    return not ip.is_global or ip.is_multicast or ip.is_unspecified
+
+
 def is_disallowed_host(hostname: str) -> bool:
-    """Validate remote hostname against DNS and loopback/private range bypass.
+    """Validate remote hostname against DNS and non-public address bypass.
+
+    Every address the hostname resolves to is checked; one non-public answer
+    is enough to refuse the host.
 
     Args:
         hostname: Input host address string.
 
     Returns:
-        bool: True if hostname resolves to private ranges or is disallowed.
+        bool: True if hostname resolves to a non-public address or is disallowed.
     """
     normalized = (hostname or "").strip().lower().strip("[]")
     if not normalized:
@@ -722,15 +746,7 @@ def is_disallowed_host(hostname: str) -> bool:
         return True
 
     try:
-        ip = ipaddress.ip_address(normalized)
-        return (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        )
+        return is_disallowed_address(ipaddress.ip_address(normalized))
     except ValueError:
         pass
 
@@ -742,21 +758,12 @@ def is_disallowed_host(hostname: str) -> bool:
     for _, _, _, _, sockaddr in addresses:
         if not sockaddr:
             continue
-        ip_str = str(sockaddr[0])
-        if ip_str.startswith("::ffff:"):
-            ip_str = ip_str[7:]
+        ip_str = str(sockaddr[0]).split("%", 1)[0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
-            continue
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
+            return True
+        if is_disallowed_address(ip):
             return True
     return False
 

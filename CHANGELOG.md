@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- [SECURITY] Harden the outbound host check for fetched image URLs: any address that is not publicly routable is refused (including the shared address range and IPv4-mapped IPv6 forms), and every resolved address of a hostname is checked.
 - [INTERNAL] Lint keeps the rule set ruff applied by default through 0.15 (`select = ["E4", "E7", "E9", "F"]`), so the widened `ruff<0.18` and `mypy<3.0` ranges do not fail CI on 17 new default-rule findings.
 - [SECURITY] Error responses no longer echo exception text: the global handler returns
   the status's standard reason phrase and image-fetch failures a fixed message (the
